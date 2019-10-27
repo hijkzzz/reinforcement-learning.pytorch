@@ -6,34 +6,27 @@ paper: https://arxiv.org/pdf/1812.05905.pdf
 '''
 
 import math
-
-import gym
-import numpy as np
-
-import torch
-
-torch.multiprocessing.set_start_method('spawn')
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
-from torch.distributions import Normal
-
-from IPython.display import clear_output
-import matplotlib.pyplot as plt
-from reacher import Reacher
 import argparse
-
-import torch.multiprocessing as mp
-
+import itertools
 from multiprocessing import Process
 from multiprocessing.managers import BaseManager
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import torch.multiprocessing as mp
+from torch.distributions import Normal
 
-parser = argparse.ArgumentParser(description='Train or test neural net motor controller.')
-parser.add_argument('--train', dest='train', action='store_true', default=False)
-parser.add_argument('--test', dest='test', action='store_true', default=False)
+import gym
+import numpy as np
+import matplotlib.pyplot as plt
 
-args = parser.parse_args()
+from util import logger
+from util import ReplayBuffer
+
+torch.multiprocessing.set_start_method('spawn')
+
 
 class NormalizedActions(gym.ActionWrapper):
     def _action(self, action):
@@ -53,26 +46,6 @@ class NormalizedActions(gym.ActionWrapper):
         action = np.clip(action, low, high)
 
         return action
-
-
-class ValueNetwork(nn.Module):
-    def __init__(self, state_dim, hidden_dim, init_w=3e-3):
-        super(ValueNetwork, self).__init__()
-
-        self.linear1 = nn.Linear(state_dim, hidden_dim)
-        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
-        self.linear3 = nn.Linear(hidden_dim, hidden_dim)
-        self.linear4 = nn.Linear(hidden_dim, 1)
-        # weights initialization
-        self.linear4.weight.data.uniform_(-init_w, init_w)
-        self.linear4.bias.data.uniform_(-init_w, init_w)
-
-    def forward(self, state):
-        x = F.relu(self.linear1(state))
-        x = F.relu(self.linear2(x))
-        x = F.relu(self.linear3(x))
-        x = self.linear4(x)
-        return x
 
 
 class SoftQNetwork(nn.Module):
@@ -97,12 +70,12 @@ class SoftQNetwork(nn.Module):
 
 
 class PolicyNetwork(nn.Module):
-    def __init__(self, num_inputs, num_actions, hidden_size, action_range=1., init_w=3e-3, log_std_min=-20, log_std_max=2):
+    def __init__(self, num_inputs, num_actions, hidden_size, init_w=3e-3, log_std_min=-20, log_std_max=2):
         super(PolicyNetwork, self).__init__()
-        
+
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
-        
+
         self.linear1 = nn.Linear(num_inputs, hidden_size)
         self.linear2 = nn.Linear(hidden_size, hidden_size)
         self.linear3 = nn.Linear(hidden_size, hidden_size)
@@ -111,12 +84,11 @@ class PolicyNetwork(nn.Module):
         self.mean_linear = nn.Linear(hidden_size, num_actions)
         self.mean_linear.weight.data.uniform_(-init_w, init_w)
         self.mean_linear.bias.data.uniform_(-init_w, init_w)
-        
+
         self.log_std_linear = nn.Linear(hidden_size, num_actions)
         self.log_std_linear.weight.data.uniform_(-init_w, init_w)
         self.log_std_linear.bias.data.uniform_(-init_w, init_w)
 
-        self.action_range = action_range
         self.num_actions = num_actions
 
     def forward(self, state):
@@ -125,173 +97,154 @@ class PolicyNetwork(nn.Module):
         x = F.relu(self.linear3(x))
         x = F.relu(self.linear4(x))
 
-        mean    = (self.mean_linear(x))
-        # mean    = F.leaky_relu(self.mean_linear(x))
+        mean = self.mean_linear(x)
         log_std = self.log_std_linear(x)
         log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
-        
-        return mean, log_std
-    
-    def evaluate(self, state, epsilon=1e-6):
-        '''
-        generate sampled action with state as input wrt the policy network;
-        '''
-        mean, log_std = self.forward(state)
-        std = log_std.exp() # no clip in evaluation, clip affects gradients flow
-        
-        normal = Normal(0, 1)
-        z = normal.sample()
-        action_0 = torch.tanh(mean + std * z.cuda())  # TanhNormal distribution as actions; reparameterization trick
-        action = self.action_range * action_0
-        log_prob = Normal(mean, std).log_prob(mean + std * z.cuda()) - torch.log(
-            1. - action_0.pow(2) + epsilon) - np.log(self.action_range)
-        # both dims of normal.log_prob and -log(1-a**2) are (N,dim_of_action);
-        # the Normal.log_prob outputs the same dim of input features instead of 1 dim probability,
-        # needs sum up across the features dim to get 1 dim prob; or else use Multivariate Normal.
-        log_prob = log_prob.sum(dim=1, keepdim=True)
-        return action, log_prob, z, mean, log_std
 
-    def get_action(self, state, deterministic):
-        state = torch.FloatTensor(state).unsqueeze(0).cuda()
-        # print(state)
+        return mean, log_std
+
+    def sample(self, state, epsilon=1e-6):
         mean, log_std = self.forward(state)
         std = log_std.exp()
-        
-        normal = Normal(0, 1)
-        z = normal.sample().cuda()
-        action = self.action_range * torch.tanh(mean + std * z)
+        normal = Normal(mean, std)
+        x_t = normal.rsample()  # rsample means it is sampled using reparameterisation trick
+        action = torch.tanh(x_t)
+        log_prob = normal.log_prob(x_t)
+        log_prob -= torch.log(1 - action.pow(2) + epsilon)
+        log_prob = log_prob.sum(1, keepdim=True)
+        return action, log_prob, torch.tanh(mean)
 
-        action = self.action_range * mean.detach().cpu().numpy()[0] if deterministic else \
-        action.detach().cpu().numpy()[0]
-        return action
 
-    def sample_action(self, ):
-        a = torch.FloatTensor(self.num_actions).uniform_(-1, 1)
-        return self.action_range * a.numpy()
+def soft_update(target, source, tau):
+    for target_param, param in zip(target.parameters(), source.parameters()):
+        target_param.data.copy_(
+            target_param.data * (1.0 - tau) + param.data * tau)
 
-class Alpha(nn.Module):
-    ''' nn.Module class of alpha variable, for the usage of parallel on gpus '''
-    def __init__(self):
-        super(Alpha, self).__init__()
-        self.log_alpha=torch.nn.Parameter(torch.zeros(1))  #initialized as [0.]: alpha->[1.]
 
-    def forward(self):
-        return self.log_alpha
+def hard_update(target, source):
+    soft_update(target, source, 1)
 
-class SAC_Trainer():
-    def __init__(self, replay_buffer, hidden_dim, action_range):
-        self.replay_buffer = replay_buffer
-        self.action_dim = action_dim
 
-        self.soft_q_net1 = SoftQNetwork(state_dim, action_dim, hidden_dim)
-        self.soft_q_net2 = SoftQNetwork(state_dim, action_dim, hidden_dim)
-        self.target_soft_q_net1 = SoftQNetwork(state_dim, action_dim, hidden_dim)
-        self.target_soft_q_net2 = SoftQNetwork(state_dim, action_dim, hidden_dim)
-        self.policy_net = PolicyNetwork(state_dim, action_dim, hidden_dim, action_range)
-        self.log_alpha = Alpha()
+class SAC():
+    def __init__(self, num_inputs, action_space, args):
+        self.gamma = args.gamma
+        self.tau = args.tau
+        self.alpha = args.alpha
+
+        self.target_update_interval = args.target_update_interval
+        self.automatic_entropy_tuning = args.automatic_entropy_tuning
+
+        self.device = torch.device("cuda" if args.cuda else "cpu") 
+
+        self.soft_q_net1 = SoftQNetwork(
+            num_inputs, action_space.shape[0], args.hidden_dim).to(self.device)
+        self.soft_q_net2 = SoftQNetwork(
+            num_inputs, action_space.shape[0], args.hidden_dim).to(self.device)
+        self.target_soft_q_net1 = SoftQNetwork(
+            num_inputs, action_space.shape[0], args.hidden_dim).to(self.device)
+        self.target_soft_q_net2 = SoftQNetwork(
+            num_inputs, action_space.shape[0], args.hidden_dim).to(self.device)
+        self.policy_net = PolicyNetwork(
+            num_inputs, action_space.shape[0], args.hidden_dim).to(self.device)
+
         print('Soft Q Network (1,2): ', self.soft_q_net1)
         print('Policy Network: ', self.policy_net)
 
-        for target_param, param in zip(self.target_soft_q_net1.parameters(),
-                                       self.soft_q_net1.parameters()):
-            target_param.data.copy_(param.data)
-        for target_param, param in zip(self.target_soft_q_net2.parameters(),
-                                       self.soft_q_net2.parameters()):
-            target_param.data.copy_(param.data)
+        hard_update(target=self.target_soft_q_net1, source=self.soft_q_net1)
+        hard_update(target=self.target_soft_q_net2, source=self.soft_q_net2)
 
-        self.soft_q_criterion1 = nn.MSELoss()
-        self.soft_q_criterion2 = nn.MSELoss()
+        self.soft_q_optimizer1 = optim.Adam(
+            self.soft_q_net1.parameters(), lr=args.lr)
+        self.soft_q_optimizer2 = optim.Adam(
+            self.soft_q_net2.parameters(), lr=args.lr)
+        self.policy_optimizer = optim.Adam(
+            self.policy_net.parameters(), lr=args.lr)
 
-        soft_q_lr = 3e-4
-        policy_lr = 3e-4
-        alpha_lr = 3e-4
+        if self.automatic_entropy_tuning == True:
+            self.target_entropy = -torch.prod(torch.Tensor(action_space.shape).to(self.device)).item() # heuristic value from the paper
+            self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
+            self.alpha_optimizer = optim.Adam(
+                self.log_alpha.parameters(), lr=args.lr)
 
-        self.soft_q_optimizer1 = SharedAdam(self.soft_q_net1.parameters(), lr=soft_q_lr)
-        self.soft_q_optimizer2 = SharedAdam(self.soft_q_net2.parameters(), lr=soft_q_lr)
-        self.policy_optimizer = SharedAdam(self.policy_net.parameters(), lr=policy_lr)
-        self.alpha_optimizer = SharedAdam(self.log_alpha.parameters(), lr=alpha_lr)
-
-    def to_cuda(self):  # copy to specified gpu
-        self.soft_q_net1 = self.soft_q_net1.cuda()
-        self.soft_q_net2 = self.soft_q_net2.cuda()
-        self.target_soft_q_net1 = self.target_soft_q_net1.cuda()
-        self.target_soft_q_net2 = self.target_soft_q_net2.cuda()
-        self.policy_net = self.policy_net.cuda()
-        self.log_alpha = self.log_alpha.cuda()
-
-    def update(self, batch_size, reward_scale=10., auto_entropy=True, target_entropy=-2, gamma=0.99,
-               soft_tau=1e-2):
-        state, action, reward, next_state, done = self.replay_buffer.sample(batch_size)
-        # print('sample:', state, action,  reward, done)
-
-        state = torch.FloatTensor(state).cuda()
-        next_state = torch.FloatTensor(next_state).cuda()
-        action = torch.FloatTensor(action).cuda()
-        reward = torch.FloatTensor(reward).unsqueeze(1).cuda()  # reward is single value, unsqueeze() to add one dim to be [reward] at the sample dim;
-        done = torch.FloatTensor(np.float32(done)).unsqueeze(1).cuda()
-
-        predicted_q_value1 = self.soft_q_net1(state, action)
-        predicted_q_value2 = self.soft_q_net2(state, action)
-        new_action, log_prob, z, mean, log_std = self.policy_net.evaluate(state)
-        new_next_action, next_log_prob, _, _, _ = self.policy_net.evaluate(next_state)
-        reward = reward_scale * (reward - reward.mean(dim=0)) / (reward.std(
-            dim=0) + 1e-6)  # normalize with batch mean and std; plus a small number to prevent numerical problem
-
-        # Updating alpha wrt entropy
-        # alpha = 0.0
-        # trade-off between exploration (max entropy) and exploitation (max Q)
-        if auto_entropy is True:
-            alpha_loss = -(self.log_alpha() * (log_prob - 1.0 * self.action_dim).detach()).mean()  # self.log_alpha as forward function to get value
-            # print('alpha loss: ',alpha_loss)
-            self.alpha_optimizer.zero_grad()
-            alpha_loss.backward()
-            self.alpha_optimizer.step()
-            self.alpha = self.log_alpha().exp()
+    def select_action(self, state, eval=False):
+        state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
+        if eval == False:
+            action, _, _ = self.policy.sample(state)
         else:
-            self.alpha = 1.
-            alpha_loss = 0
+            _, _, action = self.policy.sample(state)
+        return action.detach().cpu().numpy()[0]
 
-        # print(self.alpha)
-        # Training Q Function
-        target_q_min = torch.min(self.target_soft_q_net1(next_state, new_next_action),
-                                 self.target_soft_q_net2(next_state,
-                                                         new_next_action)) - self.alpha * next_log_prob
-        target_q_value = reward + (1 - done) * gamma * target_q_min  # if done==1, only reward
-        q_value_loss1 = self.soft_q_criterion1(predicted_q_value1,
-                                               target_q_value.detach())  # detach: no gradients for the variable
-        q_value_loss2 = self.soft_q_criterion2(predicted_q_value2, target_q_value.detach())
+    def update_parameters(self, memory, batch_size, updates):
+        state, action, reward, next_state, done = memory.sample(
+            batch_size)
+
+        state = torch.FloatTensor(state).to(self.device)
+        next_state = torch.FloatTensor(next_state).to(self.device)
+        action = torch.FloatTensor(action).to(self.device)
+        # reward is single value, unsqueeze() to add one dim to be [reward] at the sample dim;
+        reward = torch.FloatTensor(reward).unsqueeze(1).to(self.device)
+        mask = 1 - torch.FloatTensor(done).unsqueeze(1).to(self.device)
+
+        # normalize reward
+        # reward = (reward - reward.mean(dim=0)) / (reward.std(dim=0) + 1e-6)
+
+        with torch.no_grad():
+            next_state_action, next_state_log_pi, _ = self.policy_net.sample(
+                next_state)
+            qf1_next_target = self.target_soft_q_net1(
+                next_state, next_state_action)
+            qf2_next_target = self.target_soft_q_net2(
+                next_state, next_state_action)
+            min_qf_next_target = torch.min(
+                qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
+            next_q_value = reward + mask * gamma * min_qf_next_target
+
+        # Two Q-functions to mitigate positive bias in the policy improvement step
+        qf1 = self.soft_q_net1(state, action)
+        # Two Q-functions to mitigate positive bias in the policy improvement step
+        qf2 = self.soft_q_net2(state, action)
+        # JQ = 𝔼(st,at)~D[0.5(Q1(st,at) - r(st,at) - γ(𝔼st+1~p[V(st+1)]))^2]
+        qf1_loss = F.mse_loss(qf1, next_q_value)
+        # JQ = 𝔼(st,at)~D[0.5(Q1(st,at) - r(st,at) - γ(𝔼st+1~p[V(st+1)]))^2]
+        qf2_loss = F.mse_loss(qf2, next_q_value)
+
+        pi, log_pi, _ = self.policy_net.sample(state)
+        qf1_pi = self.soft_q_net1(state, pi)
+        qf2_pi = self.soft_q_net2(state, pi)
+        min_qf_pi = torch.min(qf1_pi, qf2_pi)
+
+        # Jπ = 𝔼st∼D,εt∼N[α * logπ(f(εt;st)|st) − Q(st,f(εt;st))]
+        policy_loss = ((self.alpha * log_pi) - min_qf_pi).mean()
 
         self.soft_q_optimizer1.zero_grad()
-        q_value_loss1.backward()
+        qf1_loss.backward()
         self.soft_q_optimizer1.step()
-        self.soft_q_optimizer2.zero_grad()
-        q_value_loss2.backward()
-        self.soft_q_optimizer2.step()
 
-        # Training Policy Function
-        predicted_new_q_value = torch.min(self.soft_q_net1(state, new_action),
-                                          self.soft_q_net2(state, new_action))
-        policy_loss = (self.alpha * log_prob - predicted_new_q_value).mean()
+        self.soft_q_optimizer2.zero_grad()
+        qf2_loss.backward()
+        self.soft_q_optimizer2.step()
 
         self.policy_optimizer.zero_grad()
         policy_loss.backward()
         self.policy_optimizer.step()
 
-        # print('q loss: ', q_value_loss1, q_value_loss2)
-        # print('policy loss: ', policy_loss )
+        if self.automatic_entropy_tuning:
+            alpha_loss = -(self.log_alpha * (log_pi +
+                                             self.target_entropy).detach()).mean()
 
-        # Soft update the target value net
-        for target_param, param in zip(self.target_soft_q_net1.parameters(),
-                                       self.soft_q_net1.parameters()):
-            target_param.data.copy_(  # copy data value into target parameters
-                target_param.data * (1.0 - soft_tau) + param.data * soft_tau
-            )
-        for target_param, param in zip(self.target_soft_q_net2.parameters(),
-                                       self.soft_q_net2.parameters()):
-            target_param.data.copy_(  # copy data value into target parameters
-                target_param.data * (1.0 - soft_tau) + param.data * soft_tau
-            )
-        return predicted_new_q_value.mean()
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
+
+            self.alpha = self.log_alpha.exp()
+        else:
+            alpha_loss = torch.tensor(0.).to(self.device)
+
+        if updates % self.target_update_interval == 0:
+            soft_update(self.target_soft_q_net1, self.soft_q_net1, soft_tau)
+            soft_update(self.target_soft_q_net2, self.soft_q_net2, soft_tau)
+
+        return qf1_loss.item(), qf2_loss.item(), policy_loss.item(), alpha_loss.item()
 
     def save_model(self, path):
         torch.save(self.soft_q_net1.state_dict(),
@@ -300,233 +253,128 @@ class SAC_Trainer():
         torch.save(self.policy_net.state_dict(), path + '_policy')
 
     def load_model(self, path):
-        self.soft_q_net1.load_state_dict(torch.load(path + '_q1', map_location='cuda:0'))  # map model on single gpu for testing
-        self.soft_q_net2.load_state_dict(torch.load(path + '_q2', map_location='cuda:0'))
-        self.policy_net.load_state_dict(torch.load(path + '_policy', map_location='cuda:0'))
+        # map model on single gpu for testing
+        self.soft_q_net1.load_state_dict(
+            torch.load(path + '_q1', map_location=self.device))
+        self.soft_q_net2.load_state_dict(
+            torch.load(path + '_q2', map_location=self.device))
+        self.policy_net.load_state_dict(torch.load(
+            path + '_policy', map_location=self.device))
 
         self.soft_q_net1.eval()
         self.soft_q_net2.eval()
         self.policy_net.eval()
 
 
-def worker(id, sac_trainer, ENV, rewards_queue, replay_buffer, max_episodes, max_steps, batch_size,
-           explore_steps, \
-           update_itr, action_itr, AUTO_ENTROPY, DETERMINISTIC, hidden_dim, model_path):
-    '''
-    the function for sampling with multi-processing
-    '''
+parser = argparse.ArgumentParser(description='PyTorch Soft Actor-Critic Args')
+parser.add_argument('--env-name', default="HalfCheetah-v2",
+                    help='Mujoco Gym environment')
+parser.add_argument('--policy', default="Gaussian",
+                    help='Policy Type: Gaussian | Deterministic')
+parser.add_argument('--eval', type=bool, default=True,
+                    help='Evaluates a policy a policy every 10 episode')
+parser.add_argument('--gamma', type=float, default=0.99, metavar='G',
+                    help='discount factor for reward ')
+parser.add_argument('--tau', type=float, default=0.005, metavar='G',
+                    help='target smoothing coefficient(τ) ')
+parser.add_argument('--lr', type=float, default=0.0003, metavar='G',
+                    help='learning rate ')
+parser.add_argument('--alpha', type=float, default=0.2, metavar='G',
+                    help='Temperature parameter α determines the relative importance of the entropy\
+                            term against the reward')
+parser.add_argument('--automatic_entropy_tuning', type=bool, default=False, metavar='G',
+                    help='Automaically adjust α')
+parser.add_argument('--seed', type=int, default=123456, metavar='N',
+                    help='random seed')
+parser.add_argument('--batch_size', type=int, default=256, metavar='N',
+                    help='batch size')
+parser.add_argument('--num_steps', type=int, default=1000000, metavar='N',
+                    help='maximum number of steps')
+parser.add_argument('--hidden_size', type=int, default=256, metavar='N',
+                    help='hidden size')
+parser.add_argument('--updates_per_step', type=int, default=1, metavar='N',
+                    help='model updates per simulator step')
+parser.add_argument('--start_steps', type=int, default=10000, metavar='N',
+                    help='Steps sampling random actions')
+parser.add_argument('--target_update_interval', type=int, default=1, metavar='N',
+                    help='Value target update per no. of updates per step')
+parser.add_argument('--replay_size', type=int, default=1000000, metavar='N',
+                    help='size of replay buffer')
+parser.add_argument('--cuda', action="store_true",
+                    help='run on CUDA')
 
-    with torch.cuda.device(id % torch.cuda.device_count()):
-        sac_trainer.to_cuda()
+args = parser.parse_args()
 
-        print(sac_trainer, replay_buffer)  # sac_tainer are not the same, but all networks and optimizers in it are the same; replay  buffer is the same one.
-        if ENV == 'Reacher':
-            NUM_JOINTS=2
-            LINK_LENGTH=[200, 140]
-            INI_JOING_ANGLES=[0.1, 0.1]
 
-            SCREEN_SIZE=1000
-            SPARSE_REWARD=False
-            SCREEN_SHOT=False
-            action_range = 10.0
+# Environment
+# env = NormalizedActions(gym.make(args.env_name))
+env = gym.make(args.env_name)
+torch.manual_seed(args.seed)
+np.random.seed(args.seed)
+env.seed(args.seed)
 
-            env=Reacher(screen_size=SCREEN_SIZE, num_joints=NUM_JOINTS, link_lengths = LINK_LENGTH, \
-            ini_joint_angles=INI_JOING_ANGLES, target_pos = [369,430], render=True, change_goal=False)
-            action_dim = env.num_actions
-            state_dim  = env.num_observations
+# Agent
+agent = SAC(env.observation_space.shape[0], env.action_space, args)
 
-        elif ENV == 'Pendulum':
-            env = NormalizedActions(gym.make("Pendulum-v0"))
-            action_dim = env.action_space.shape[0]
-            state_dim  = env.observation_space.shape[0]
-            action_range=1.
-        
-        frame_idx=0
-        rewards=[]
-        # training loop
-        for eps in range(max_episodes):
+# Memory
+memory = ReplayBuffer(capacity=args.replay_buffer_size)
+
+# Training Loop
+total_numsteps = 0
+updates = 0
+
+for i_episode in itertools.count(1):
+    episode_reward = 0
+    episode_steps = 0
+    done = False
+    state = env.reset()
+
+    while not done:
+        if total_numsteps < args.start_steps:
+            action = env.action_space.sample()  # Sample random action
+        else:
+            action = agent.select_action(state)  # Sample action from policy
+
+        if len(memory) > args.batch_size:
+            # Number of updates per step in environment
+            for i in range(args.updates_per_step):
+                # Update parameters of all the networks
+                critic_1_loss, critic_2_loss, policy_loss, ent_loss, alpha = agent.update_parameters(memory, args.batch_size, updates)
+
+                updates += 1
+
+        next_state, reward, done, _ = env.step(action) # Step
+        episode_steps += 1
+        total_numsteps += 1
+        episode_reward += reward
+
+        # Ignore the "done" signal if it comes from hitting the time horizon.
+        # (https://github.com/openai/spinningup/blob/master/spinup/algos/sac/sac.py)
+        mask = 1 if episode_steps == env._max_episode_steps else float(not done)
+
+        memory.push(state, action, reward, next_state, mask) # Append transition to memory
+
+        state = next_state
+
+    if total_numsteps > args.num_steps:
+        break
+
+    if i_episode % 10 == 0 and args.eval == True:
+        avg_reward = 0.
+        episodes = 10
+        for _  in range(episodes):
+            state = env.reset()
             episode_reward = 0
-            if ENV == 'Reacher':
-                state = env.reset(SCREEN_SHOT)
-            elif ENV == 'Pendulum':
-                state =  env.reset()
-            
-            for step in range(max_steps):
-                if frame_idx > explore_steps:
-                    action = sac_trainer.policy_net.get_action(state, deterministic = DETERMINISTIC)
-                else:
-                    action = sac_trainer.policy_net.sample_action()
-        
-                try:
-                    if ENV ==  'Reacher':
-                        next_state, reward, done, _ = env.step(action, SPARSE_REWARD, SCREEN_SHOT)
-                    elif ENV ==  'Pendulum':
-                        next_state, reward, done, _ = env.step(action)
-                        env.render() 
-                except KeyboardInterrupt:
-                    print('Finished')
-                    sac_trainer.save_model(model_path)
+            done = False
+            while not done:
+                action = agent.select_action(state, eval=True)
 
-                replay_buffer.push(state, action, reward, next_state, done)
+                next_state, reward, done, _ = env.step(action)
+                episode_reward += reward
+
 
                 state = next_state
-                episode_reward += reward
-                frame_idx += 1
+            avg_reward += episode_reward
+        avg_reward /= episodes
 
-                # if len(replay_buffer) > batch_size:
-                if replay_buffer.get_length() > batch_size:
-                    for i in range(update_itr):
-                        _ = sac_trainer.update(batch_size, reward_scale=10., auto_entropy=AUTO_ENTROPY,
-                                                target_entropy=-1. * action_dim)
-
-                if eps % 10 == 0 and eps > 0:
-                    # plot(rewards, id)
-                    sac_trainer.save_model(model_path)
-
-                if done:
-                    break
-            print('Worker: ', id, '| Episode: ', eps, '| Episode Reward: ', episode_reward)
-            # if len(rewards) == 0:
-            #     rewards.append(episode_reward)
-            # else:
-            #     rewards.append(rewards[-1] * 0.9 + episode_reward * 0.1)
-            rewards_queue.put(episode_reward)
-
-        sac_trainer.save_model(model_path)
-
-
-def ShareParameters(adamoptim):
-    ''' share parameters of Adamoptimizers for multiprocessing '''
-    for group in adamoptim.param_groups:
-        for p in group['params']:
-            state = adamoptim.state[p]
-            # initialize: have to initialize here, or else cannot find
-            state['step'] = 0
-            state['exp_avg'] = torch.zeros_like(p.data)
-            state['exp_avg_sq'] = torch.zeros_like(p.data)
-
-            # share in memory
-            state['exp_avg'].share_memory_()
-            state['exp_avg_sq'].share_memory_()
-
-
-def plot(rewards):
-    clear_output(True)
-    plt.figure(figsize=(20, 5))
-    plt.plot(rewards)
-    plt.savefig('sac_v2_multi.png')
-    # plt.show()
-    plt.clf()
-
-
-if __name__ == '__main__':
-
-    replay_buffer_size = 1e6
-    # replay_buffer = ReplayBuffer(replay_buffer_size)
-
-    # the replay buffer is a class, have to use torch manager to make it a proxy for sharing across processes
-    BaseManager.register('ReplayBuffer', ReplayBuffer)
-    manager = BaseManager()
-    manager.start()
-    replay_buffer = manager.ReplayBuffer(
-        replay_buffer_size)  # share the replay buffer through manager
-
-# choose env
-    ENV = ['Pendulum', 'Reacher'][0]
-    if ENV == 'Reacher':
-        NUM_JOINTS=2
-        LINK_LENGTH=[200, 140]
-        SCREEN_SIZE=1000
-        SPARSE_REWARD=False
-        SCREEN_SHOT=False
-        action_range = 10.0
-
-        env=Reacher(screen_size=SCREEN_SIZE, num_joints=NUM_JOINTS, link_lengths = LINK_LENGTH, \
-        ini_joint_angles=INI_JOING_ANGLES, target_pos = [369,430], render=True, change_goal=False)
-        action_dim = env.num_actions
-        state_dim  = env.num_observations
-
-    elif ENV == 'Pendulum':
-        env = NormalizedActions(gym.make("Pendulum-v0"))
-        action_dim = env.action_space.shape[0]
-        state_dim  = env.observation_space.shape[0]
-        action_range=1.
-
-    # hyper-parameters for RL training, no need for sharing across processes
-    max_episodes = 1000
-    max_steps   = 20 if ENV ==  'Reacher' else 150  # Pendulum needs 150 steps per episode to learn well, cannot handle 20
-    explore_steps = 0  # for random action sampling in the beginning of training
-    batch_size = 640
-    update_itr = 1
-    action_itr = 3
-    AUTO_ENTROPY = True
-    DETERMINISTIC = False
-    hidden_dim = 512
-    model_path = './sac_model/sac_v2_multiprocess_multi'
-
-    sac_trainer = SAC_Trainer(replay_buffer, hidden_dim=hidden_dim, action_range=action_range)
-
-    if args.train:
-
-        # share the global parameters in multiprocessing
-        sac_trainer.soft_q_net1.share_memory()
-        sac_trainer.soft_q_net2.share_memory()
-        sac_trainer.target_soft_q_net1.share_memory()
-        sac_trainer.target_soft_q_net2.share_memory()
-        sac_trainer.policy_net.share_memory()
-        ShareParameters(sac_trainer.soft_q_optimizer1)
-        ShareParameters(sac_trainer.soft_q_optimizer2)
-        ShareParameters(sac_trainer.policy_optimizer)
-        ShareParameters(sac_trainer.alpha_optimizer)
-
-        rewards_queue = mp.Queue()  # used for get rewards from all processes and plot the curve
-
-        num_workers = 2  # or: mp.cpu_count()
-        processes = []
-        rewards = [0]
-
-        for i in range(num_workers):
-            process = Process(target=worker, args=(
-            i, sac_trainer, ENV, rewards_queue, replay_buffer, max_episodes, max_steps, \
-            batch_size, explore_steps, update_itr, action_itr, AUTO_ENTROPY, DETERMINISTIC,
-            hidden_dim, model_path))  # the args contain shared and not shared
-            process.daemon = True  # all processes closed when the main stops
-            processes.append(process)
-
-        [p.start() for p in processes]
-        while True:  # keep geting the episode reward from the queue
-            r = rewards_queue.get()
-            if r is not None:
-                rewards.append(0.9 * rewards[-1] + 0.1 * r)  # moving average of episode rewards
-            else:
-                break
-
-            if len(rewards) % 20 == 0 and len(rewards) > 0:
-                plot(rewards)
-
-        [p.join() for p in processes]  # finished at the same time
-
-        sac_trainer.save_model(model_path)
-
-    if args.test:
-        # single process for testing
-        env = L2RunEnv(visualize=True)  # L2M2019Env
-        sac_trainer.load_model(model_path)
-        sac_trainer.to_cuda()  # from cpu to cuda
-
-        for eps in range(10):
-            if ENV == 'Reacher':
-                state = env.reset(SCREEN_SHOT)
-            elif ENV == 'Pendulum':
-                state =  env.reset()
-            episode_reward = 0
-
-            for step in range(max_steps):
-                action = sac_trainer.policy_net.get_action(state, deterministic = DETERMINISTIC)
-                if ENV ==  'Reacher':
-                    next_state, reward, done, _ = env.step(action, SPARSE_REWARD, SCREEN_SHOT)
-                elif ENV ==  'Pendulum':
-                    next_state, reward, done, _ = env.step(action)
-                    env.render()   
-
-            print('Episode: ', eps, '| Episode Reward: ', episode_reward)
+env.close()
