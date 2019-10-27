@@ -25,9 +25,6 @@ import matplotlib.pyplot as plt
 from util import logger
 from util import ReplayBuffer
 
-torch.multiprocessing.set_start_method('spawn')
-
-
 class NormalizedActions(gym.ActionWrapper):
     def _action(self, action):
         low = self.action_space.low
