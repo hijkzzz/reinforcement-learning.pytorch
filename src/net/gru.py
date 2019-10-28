@@ -4,7 +4,7 @@ from torch import nn
 
 class GRUCell(nn.Module):
     def __init__(self, input_size, hidden_size):
-        super(GRUCell, self).__init__()
+        super(GRU, self).__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
 
@@ -17,12 +17,11 @@ class GRUCell(nn.Module):
         self.h_w = nn.Linear(input_size, hidden_size)
         self.h_u = nn.Linear(hidden_size, hidden_size)
 
-    def forward(self, input, hidden, mask):
+    def forward(self, input, hidden):
         T = input.shape[0]
         B = input.shape[1]
         output = torch.empty((T, B, self.hidden_size),
                               dtype=input.dtype, device=input.device)
-        mask.unsqueeze(2) # add trailing dimension
 
         for i in range(T):
             zt = torch.sigmoid(self.zt_w(input[i]) + self.zt_u(hidden))
@@ -30,5 +29,4 @@ class GRUCell(nn.Module):
             nt = torch.tanh(self.h_w(input[i]) + self.h_u(hidden) * rt)
             output[i, :] = hidden = (1 - zt) * nt + zt * hidden
 
-            hidden *= mask[i]
         return output, hidden

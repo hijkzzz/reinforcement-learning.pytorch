@@ -8,14 +8,13 @@ from torch import nn
 from torch import optim
 from torch.distributions import Categorical
 
-from net import GRUCell
 from util import init_orthogonal_
 from util import logger
 
 
-class RNNActorCritic(nn.Module):
+class ActorCritic(nn.Module):
     def __init__(self, action_size, hidden_size=128, memory_size=128, extra_hidden=True, enlargement='normal', device=torch.device('cuda')):
-        super(RNNActorCritic, self).__init__()
+        super(ActorCritic, self).__init__()
 
         enlargement = {
             'small': 1,
@@ -43,7 +42,7 @@ class RNNActorCritic(nn.Module):
             nn.ReLU()
         )
 
-        self.rnn = GRUCell(hidden_size, memory_size)
+        self.rnn = nn.GRUCell(hidden_size, memory_size)
 
         if self.extra_hidden:
             self.fc2val = nn.Sequential(nn.Linear(memory_size, memory_size),
@@ -53,109 +52,44 @@ class RNNActorCritic(nn.Module):
 
         self.action = nn.Sequential(nn.Linear(memory_size, action_size),
                                     nn.Softmax(dim=1))
-        self.value_int = nn.Linear(memory_size, 1)
-        self.value_ext = nn.Linear(memory_size, 1)
+        self.value = nn.Linear(memory_size, 1)
 
-    def forward(self, states, masks=None, hiddens=None):
-        num_steps = states.shape[0]
-        num_envs = states.shape[1]
+    def forward(self, states, hiddens=None):
+        T = states.shape[0]
+        B = states.shape[1]
 
         if hiddens is None:
-            hiddens = self.init_hidden(num_envs)
+            hiddens = self.init_hidden(B)
 
-        if masks is None:
-            masks = torch.ones((num_steps, num_envs), dtype=states.dtype, device=states.device)
-
-        states = states.contiguous().view(num_steps * num_envs, *states.shape[2:])
+        states = states.view(T * B, *states.shape[2:])
         states = self.conv(states)
-        states = states.view(num_steps, num_envs, 6 ** 2 * 64)
+        states = states.view(T, B, 6 ** 2 * 64)
         states = self.fc(states)
 
-        states, hiddens = self.rnn(states, masks, hiddens)
+        states, hiddens = self.rnn(states, hiddens)
 
         value = probs = states
         if self.extra_hidden:
             probs = self.fc2act(probs) + probs
             value = self.fc2val(value) + value
 
-        probs_action = self.action(probs)
-        dist_action = Categorical(probs_action)
+        probs = self.action(probs)
+        dist = Categorical(probs)
+        value = self.value(value)
 
-        value_int = self.value_int(value)
-        value_ext = self.value_ext(value)
-        return dist_action, torch.log(probs_action), value_ext.squeeze(2), value_int.squeeze(2), hiddens
+        return dist, torch.log(probs), value, hiddens
 
     def init_hidden(self, batch_size):
         return torch.zeros(1, batch_size, self.hidden_size, device=self.device)
-
-
-class CNNActorCritic(nn.Module):
-    def __init__(self, action_size, hidden_size=128, extra_hidden=True, enlargement='normal'):
-        super(CNNActorCritic, self).__init__()
-
-        enlargement = {
-            'small': 1,
-            'normal': 2,
-            'large': 4
-        }[enlargement]
-
-        hidden_size *= enlargement
-        self.extra_hidden = extra_hidden
-        self.hidden_size = hidden_size
-
-        self.conv = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=4, stride=1),
-            nn.ReLU()
-        )
-
-        self.fc = nn.Sequential(
-            nn.Linear(6 ** 2 * 64, hidden_size),
-            nn.ReLU()
-        )
-
-        if self.extra_hidden:
-            self.fc2val = nn.Sequential(nn.Linear(hidden_size, hidden_size),
-                                        nn.ReLU())
-            self.fc2act = nn.Sequential(nn.Linear(hidden_size, hidden_size),
-                                        nn.ReLU())
-
-        self.action = nn.Sequential(nn.Linear(hidden_size, action_size),
-                                    nn.Softmax(dim=1))
-        self.value_int = nn.Linear(hidden_size, 1)
-        self.value_ext = nn.Linear(hidden_size, 1)
-
-    def forward(self, states, masks=None, hiddens=None):
-        states = self.conv(states)
-        states = states.view(-1, 6 ** 2 * 64)
-        states = self.fc(states)
-
-        value = probs = states
-        if self.extra_hidden:
-            probs = self.fc2act(probs) + probs
-            value = self.fc2val(value) + value
-
-        probs_action = self.action(probs)
-        dist_action = Categorical(probs_action)
-
-        value_int = self.value_int(value)
-        value_ext = self.value_ext(value)
-        return dist_action, torch.log(probs_action), value_ext.squeeze(1), value_int.squeeze(1), hiddens
 
 class PPO():
     def __init__(self, args):
         super(PPO, self).__init__()
         # neural networks
-        self.actor_critic = RNNActorCritic(action_size=args.action_size, hidden_size=args.hidden_size,
+        self.actor_critic = ActorCritic(action_size=args.action_size, hidden_size=args.hidden_size,
                                            memory_size=args.memory_size, extra_hidden=args.extra_hidden,
                                            enlargement=args.enlargement, device=args.device).cuda()
         self.actor_critic.apply(weight_init)
-
-        self.memories = MemoryNetworkWrapper(num_memories=args.num_memories,
-                                             lamda=args.lamda_memory, hidden_size=args.hidden_size, enlargement=args.enlargement, device=args.device)
 
         # args
         self.device = args.device
@@ -169,22 +103,12 @@ class PPO():
         self.batch_size = args.batch_size
         self.clip_range = args.clip_range
         self.max_grad_norm = args.max_grad_norm
-        self.gamma_int = args.gamma_int
-        self.gamma_ext = args.gamma_ext
-        self.coeff_int = args.coeff_int
-        self.coeff_ext = args.coeff_ext
-        self.coeff_ent = args.coeff_ent
-        self.lamda_gae = args.lamda_gae
+        self.gamma = args.gamma
+        self.lamda = args.lamda
         self.episode_int = args.episode_int
 
         self.num_batch = self.num_steps * self.num_envs // self.batch_size
         self.stride_batch = self.num_envs // self.num_batch
-
-        # running mean std
-        self.reward_int_forward = RewardForwardFilter(args.gamma_int)
-        self.reward_int_mean_std = RunningMeanStd(use_mpi=False)
-        self.observation_mean_std = RunningMeanStd(
-            shape=(84, 84), use_mpi=False)
 
         # logger info
         self.training_step = 0
@@ -195,8 +119,6 @@ class PPO():
         # optimizer
         self.optimizer = optim.Adam(
             self.actor_critic.parameters(), args.learning_rate)
-        if not os.path.exists('./saved'):
-            os.makedirs('./saved/')
 
     def select_action(self, states, hiddens):
         # T * B * features
