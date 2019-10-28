@@ -106,6 +106,8 @@ class PolicyNetwork(nn.Module):
 
 class SAC():
     def __init__(self, num_inputs, action_space, args):
+        self.args = args
+
         self.gamma = args.gamma
         self.tau = args.tau
         self.alpha = args.alpha
@@ -227,81 +229,25 @@ class SAC():
 
     def save_model(self, path):
         torch.save(self.soft_q_net1.state_dict(),
-                   path + '_q1')  # have to specify different path name here!
-        torch.save(self.soft_q_net2.state_dict(), path + '_q2')
-        torch.save(self.policy_net.state_dict(), path + '_policy')
+                   path + '/_q1')  # have to specify different path name here!
+        torch.save(self.soft_q_net2.state_dict(), path + '/_q2')
+        torch.save(self.policy_net.state_dict(), path + '/_policy')
 
     def load_model(self, path):
         # map model on single gpu for testing
         self.soft_q_net1.load_state_dict(
-            torch.load(path + '_q1', map_location=self.device))
+            torch.load(path + '/_q1', map_location=self.device))
         self.soft_q_net2.load_state_dict(
-            torch.load(path + '_q2', map_location=self.device))
+            torch.load(path + '/_q2', map_location=self.device))
         self.policy_net.load_state_dict(torch.load(
-            path + '_policy', map_location=self.device))
+            path + '/_policy', map_location=self.device))
 
         self.soft_q_net1.eval()
         self.soft_q_net2.eval()
         self.policy_net.eval()
 
-
-def soft_update(target, source, tau):
-    for target_param, param in zip(target.parameters(), source.parameters()):
-        target_param.data.copy_(
-            target_param.data * (1.0 - tau) + param.data * tau)
-
-
-def hard_update(target, source):
-    soft_update(target, source, 1)
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description='PyTorch Soft Actor-Critic Args')
-    parser.add_argument('--env-name', default="HalfCheetah-v2",
-                        help='Mujoco Gym environment')
-    parser.add_argument('--eval', type=bool, default=True,
-                        help='Evaluates a policy')
-    parser.add_argument('--gamma', type=float, default=0.99, metavar='G',
-                        help='discount factor for reward ')
-    parser.add_argument('   --tau', type=float, default=0.005, metavar='G',
-                        help='target smoothing coefficient(τ) ')
-    parser.add_argument('--lr', type=float, default=0.0003, metavar='G',
-                        help='learning rate ')
-    parser.add_argument('--alpha', type=float, default=0.2, metavar='G',
-                        help='Temperature parameter α determines the relative importance of the entropy\
-                                term against the reward')
-    parser.add_argument('--automatic_entropy_tuning', type=bool, default=False, metavar='G',
-                        help='Automaically adjust α')
-    parser.add_argument('--seed', type=int, default=123456, metavar='N',
-                        help='random seed')
-    parser.add_argument('--batch_size', type=int, default=256, metavar='N',
-                        help='batch size')
-    parser.add_argument('--num_steps', type=int, default=1000000, metavar='N',
-                        help='maximum number of steps')
-    parser.add_argument('--hidden_size', type=int, default=256, metavar='N',
-                        help='hidden size')
-    parser.add_argument('--updates_per_step', type=int, default=1, metavar='N',
-                        help='model updates per simulator step')
-    parser.add_argument('--start_steps', type=int, default=10000, metavar='N',
-                        help='Steps sampling random actions')
-    parser.add_argument('--target_update_interval', type=int, default=1, metavar='N',
-                        help='Value target update per no. of updates per step')
-    parser.add_argument('--replay_size', type=int, default=1000000, metavar='N',
-                        help='size of replay buffer')
-    args = parser.parse_args()
-
-    # Environment
-    # env = NormalizedActions(gym.make(args.env_name))
-    env = gym.make(args.env_name)
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    env.seed(args.seed)
-
-    # Agent
-    agent = SAC(env.observation_space.shape[0], env.action_space, args)
-
-    if not args.eval:
+    def train(self, env):
+        args = self.args
         # Memory
         memory = ReplayBuffer(capacity=args.replay_buffer_size)
 
@@ -320,13 +266,13 @@ def main():
                     action = env.action_space.sample()  # Sample random action
                 else:
                     # Sample action from policy
-                    action = agent.select_action(state)
+                    action = self.select_action(state)
 
                 if len(memory) > args.batch_size:
                     # Number of updates per step in environment
                     for i in range(args.updates_per_step):
                         # Update parameters of all the networks
-                        q1_loss, q2_loss, policy_loss, alpha_loss = agent.update_parameters(
+                        q1_loss, q2_loss, policy_loss, alpha_loss = self.update_parameters(
                             memory, args.batch_size, updates)
                         updates += 1
 
@@ -356,28 +302,95 @@ def main():
 
                 state = next_state
 
+            if i_episode % 1000 == 0:
+                self.save_model('./temp')
+
             if total_numsteps > args.num_steps:
-                break
-        else:
-            avg_reward = 0.
-            episodes = 10
-            for _ in range(episodes):
-                state = env.reset()
-                episode_reward = 0
-                done = False
-                while not done:
-                    action = agent.select_action(state, eval=True)
+                return
 
-                    next_state, reward, done, _ = env.step(action)
-                    episode_reward += reward
-                    logger.info('episode reward %f' %(episode_reward))
+    def test(self, env):
+        self.load_model('./temp')
 
-                    state = next_state
-                avg_reward += episode_reward
-            avg_reward /= episodes
-            logger.info('avg reward %f' %(avg_reward))
+        avg_reward = 0.
+        episodes = 10
+        for _ in range(episodes):
+            state = env.reset()
+            episode_reward = 0
+            done = False
+            while not done:
+                action = self.select_action(state, eval=True)
+
+                next_state, reward, done, _ = env.step(action)
+                episode_reward += reward
+                logger.info('episode reward %f' %(episode_reward))
+
+                state = next_state
+            avg_reward += episode_reward
+        avg_reward /= episodes
+        logger.info('avg reward %f' %(avg_reward))
+
+
+def soft_update(target, source, tau):
+    for target_param, param in zip(target.parameters(), source.parameters()):
+        target_param.data.copy_(
+            target_param.data * (1.0 - tau) + param.data * tau)
+
+
+def hard_update(target, source):
+    soft_update(target, source, 1)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='PyTorch Soft Actor-Critic Args')
+    parser.add_argument('--env-name', default="HalfCheetah-v2",
+                        help='Mujoco Gym environment')
+    parser.add_argument('--gamma', type=float, default=0.99, metavar='G',
+                        help='discount factor for reward ')
+    parser.add_argument('   --tau', type=float, default=0.005, metavar='G',
+                        help='target smoothing coefficient(τ) ')
+    parser.add_argument('--lr', type=float, default=0.0003, metavar='G',
+                        help='learning rate ')
+    parser.add_argument('--alpha', type=float, default=0.2, metavar='G',
+                        help='Temperature parameter α determines the relative importance of the entropy\
+                                term against the reward')
+    parser.add_argument('--automatic_entropy_tuning', type=bool, default=False, metavar='G',
+                        help='Automaically adjust α')
+    parser.add_argument('--seed', type=int, default=123456, metavar='N',
+                        help='random seed')
+    parser.add_argument('--batch_size', type=int, default=256, metavar='N',
+                        help='batch size')
+    parser.add_argument('--num_steps', type=int, default=1000000, metavar='N',
+                        help='maximum number of steps')
+    parser.add_argument('--hidden_size', type=int, default=256, metavar='N',
+                        help='hidden size')
+    parser.add_argument('--updates_per_step', type=int, default=1, metavar='N',
+                        help='model updates per simulator step')
+    parser.add_argument('--start_steps', type=int, default=10000, metavar='N',
+                        help='Steps sampling random actions')
+    parser.add_argument('--target_update_interval', type=int, default=1, metavar='N',
+                        help='Value target update per no. of updates per step')
+    parser.add_argument('--replay_size', type=int, default=1000000, metavar='N',
+                        help='size of replay buffer')
+    parser.add_argument('--train', type=bool, default=True,
+                    help='Train a policy')
+    args = parser.parse_args()
+
+    # Environment
+    # env = NormalizedActions(gym.make(args.env_name))
+    env = gym.make(args.env_name)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    env.seed(args.seed)
+
+    # Agent
+    agent = SAC(env.observation_space.shape[0], env.action_space, args)
+    if args.train:
+        agent.train(env)
+    else:
+        agent.test(env)   
+
     env.close()
-
 
 if __name__ == '__main__':
     main()
