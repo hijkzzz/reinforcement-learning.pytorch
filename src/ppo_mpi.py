@@ -82,14 +82,15 @@ class ActorCritic(nn.Module):
     def init_hidden(self, batch_size):
         return torch.zeros(1, batch_size, self.hidden_size, device=self.device)
 
+
 class PPO():
     def __init__(self, args):
         super(PPO, self).__init__()
         # neural networks
         self.actor_critic = ActorCritic(action_size=args.action_size, hidden_size=args.hidden_size,
-                                           memory_size=args.memory_size, extra_hidden=args.extra_hidden,
-                                           enlargement=args.enlargement, device=args.device).cuda()
-        self.actor_critic.apply(weight_init)
+                                        memory_size=args.memory_size, extra_hidden=args.extra_hidden,
+                                        enlargement=args.enlargement, device=args.device).cuda()
+        self.actor_critic.apply(init_orthogonal_)
 
         # args
         self.device = args.device
@@ -107,41 +108,40 @@ class PPO():
         self.lamda = args.lamda
         self.episode_int = args.episode_int
 
-        self.num_batch = self.num_steps * self.num_envs // self.batch_size
-        self.stride_batch = self.num_envs // self.num_batch
-
-        # logger info
-        self.training_step = 0
-        self.best_reward = 0
-        self.visited_rooms = set()
-        self.eplen = 0
-
         # optimizer
         self.optimizer = optim.Adam(
             self.actor_critic.parameters(), args.learning_rate)
 
     def select_action(self, states, hiddens):
-        # T * B * features
-        states = torch.from_numpy(states).unsqueeze(0).to(
-            device=self.device, dtype=torch.float32).permute([0, 1, 4, 2, 3]) / 255.0
+        # H * W * C ==> C * H * W
+        states = torch.from_numpy(states).unsqueeze(0).permute([0, 1, 4, 2, 3]).to(
+            device=self.device, dtype=torch.float32) / 255.0
 
         with torch.no_grad():
-            dist_action, _, _, _, hiddens = self.actor_critic(
-                states, None, hiddens)
-        action = dist_action.sample()
-        action_log_prob = dist_action.log_prob(action)
-        return action[0].cpu().tolist(), action_log_prob[0].cpu().numpy(), hiddens
+            dist, _, _, hiddens = self.actor_critic(
+                states, hiddens)
+        action = dist.sample()
+        log_prob = dist.log_prob(action)
+        return action[0].cpu().tolist(), log_prob[0].cpu().numpy(), hiddens
 
-    def save_param(self):
+    def save_param(self, path):
         torch.save(self.actor_critic.state_dict(),
-                   './saved/actor_critic' + str(time.time())[:10] + '.pkl')
+                   path + '/actor_critic.pkl')
+
+    def load_param(self, path):
+        self.actor_critic.load(path + '/actor_critic.pkl')
 
     def train(self, envs):
+        self.training_step = 0
+        self.best_reward = 0
+        self.visited_rooms = set()
+        self.eplen = 0
+
         state = envs.reset()
-        rollout_id = 0
+        rollout_idx = 0
 
         # rollout
-        while rollout_id < self.num_rollouts:
+        while rollout_idx < self.num_rollouts:
             current_best_reward = 0
 
             states = np.zeros(
@@ -149,7 +149,7 @@ class PPO():
             actions = np.zeros((self.num_steps, self.num_envs), np.int32)
             action_log_probs = np.zeros(
                 (self.num_steps, self.num_envs), np.float32)
-            rewards_ext = np.zeros((self.num_steps, self.num_envs), np.float32)
+            rewards = np.zeros((self.num_steps, self.num_envs), np.float32)
             next_states = np.zeros(
                 (self.num_steps, self.num_envs, 84, 84, 1), np.float32)
             dones = np.zeros((self.num_steps, self.num_envs), np.int32)
@@ -159,7 +159,7 @@ class PPO():
             for t in range(self.num_steps):
                 action, action_log_prob, hidden = self.select_action(
                     state, hidden)
-                next_state, reward_ext, done, info = envs.step(action)
+                next_state, reward, done, info = envs.step(action)
 
                 if self.render:
                     envs.render(0)
@@ -167,9 +167,6 @@ class PPO():
                 # done
                 for i, dne in enumerate(done):
                     if dne:
-                        hidden[0][i] *= 0
-
-                        # info
                         epinfo = info[i]['episode']
                         if 'visited_rooms' in epinfo:
                             self.visited_rooms.union(
@@ -184,25 +181,24 @@ class PPO():
                 states[t, ...] = state
                 actions[t, ...] = action
                 action_log_probs[t, ...] = action_log_prob
-                rewards_ext[t, ...] = reward_ext
+                rewards[t, ...] = reward
                 next_states[t, ...] = next_state
                 dones[t, ...] = done
 
             # logger
-            logger.info('>>> rollout: {}'.format(rollout_id))
-            logger.record_tabular('visited rooms',
+            logger.record_tabular('visited_rooms',
                                   str(len(self.visited_rooms)) + ', ' + str(self.visited_rooms))
-            logger.record_tabular('best reward', self.best_reward)
-            logger.record_tabular('current best reward', current_best_reward)
-            logger.record_tabular('total steps', self.eplen)
+            logger.record_tabular('best_reward', self.best_reward)
+            logger.record_tabular('current_best_reward', current_best_reward)
+            logger.record_tabular('eplen', self.eplen)
             logger.dump_tabular()
 
             # train neural networks
-            self.update(states, actions, action_log_probs,
-                        rewards_ext, next_states, dones)
-            rollout_id += 1
+            self.update_parameters(states, actions, action_log_probs,
+                        rewards, next_states, dones)
+            rollout_idx += 1
 
-    def update(self, states, actions, action_log_probs, rewards_ext, next_states, dones):
+    def update_parameters(self, states, actions, action_log_probs, rewards_ext, next_states, dones):
         # T * B * features
         states = torch.from_numpy(states).to(
             dtype=torch.float32, device=self.device).permute([0, 1, 4, 2, 3]) / 255.0
