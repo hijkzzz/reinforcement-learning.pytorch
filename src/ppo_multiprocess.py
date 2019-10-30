@@ -17,8 +17,9 @@ from env import SubprocVecEnv
 from env import make_atari, wrap_deepmind
 from env import Monitor
 
+
 class ActorCritic(nn.Module):
-    def __init__(self, action_size, hidden_size=128, memory_size=128, extra_hidden=True, enlargement='normal', device=torch.device('cuda')):
+    def __init__(self, action_size, hidden_size=128, extra_hidden=True, enlargement='normal', device=torch.device('cuda')):
         super(ActorCritic, self).__init__()
 
         enlargement = {
@@ -28,7 +29,6 @@ class ActorCritic(nn.Module):
         }[enlargement]
 
         hidden_size *= enlargement
-        memory_size *= enlargement
         self.extra_hidden = extra_hidden
         self.hidden_size = hidden_size
         self.device = device
@@ -47,17 +47,17 @@ class ActorCritic(nn.Module):
             nn.ReLU()
         )
 
-        self.gru = nn.GRU(input_size=hidden_size, hidden_size=memory_size)
+        self.gru = nn.GRU(input_size=hidden_size, hidden_size=hidden_size)
 
         if self.extra_hidden:
-            self.fc2val = nn.Sequential(nn.Linear(memory_size, memory_size),
+            self.fc2val = nn.Sequential(nn.Linear(hidden_size, hidden_size),
                                         nn.ReLU())
-            self.fc2act = nn.Sequential(nn.Linear(memory_size, memory_size),
+            self.fc2act = nn.Sequential(nn.Linear(hidden_size, hidden_size),
                                         nn.ReLU())
 
-        self.action = nn.Sequential(nn.Linear(memory_size, action_size),
+        self.action = nn.Sequential(nn.Linear(hidden_size, action_size),
                                     nn.Softmax(dim=1))
-        self.value = nn.Linear(memory_size, 1)
+        self.value = nn.Linear(hidden_size, 1)
 
     def forward(self, states, hiddens=None):
         T = states.shape[0]
@@ -68,9 +68,9 @@ class ActorCritic(nn.Module):
 
         states = states.view(T * B, *states.shape[2:])
         states = self.conv(states)
-        states = states.view(T, B, 6 ** 2 * 64)
         states = self.fc(states)
 
+        states = states.view(T, B, self.hidden_size)
         states, hiddens = self.gru(states, hiddens)
 
         value = probs = states
@@ -98,7 +98,7 @@ class PPO():
 
         # neural networks
         self.actor_critic = ActorCritic(action_size=args.action_size, hidden_size=args.hidden_size,
-                                        memory_size=args.memory_size, extra_hidden=args.extra_hidden,
+                                        extra_hidden=args.extra_hidden,
                                         enlargement=args.enlargement, device=args.device).cuda()
         self.actor_critic.apply(init_orthogonal_)
 
@@ -134,7 +134,7 @@ class PPO():
 
         with torch.no_grad():
             dist, _, _, hiddens = self.actor_critic(
-                states, hiddens) 
+                states, hiddens)
         action = dist.sample()
         log_prob = dist.log_prob(action)
         return action[0].cpu().tolist(), log_prob[0].cpu().numpy(), hiddens
@@ -167,7 +167,7 @@ class PPO():
             advantages = torch.zeros_like(rewards)
             _, _, values, _ = self.actor_critic(
                 torch.cat([states, next_states[-1].unsqueeze(0)], dim=0))
-            values = values.squeeze(2) # remove last dimension
+            values = values.squeeze(2)  # remove last dimension
 
             last_gae_lam = 0
             for t in range(self.num_steps - 1, -1, -1):
@@ -236,9 +236,9 @@ class PPO():
 
         logger.info('UPDATE')
         logger.record_tabular('training_step',
-            self.training_step)
+                              self.training_step)
         logger.record_tabular('value_loss',
-                                value_loss.item())
+                              value_loss.item())
         logger.record_tabular('policy_loss', action_loss.item())
         logger.record_tabular('entropy_loss', entropy_loss.item())
         logger.dump_tabular()
@@ -301,7 +301,7 @@ class PPO():
                         self.eplen += epinfo['l']
 
             # logger
-            logger.info('STATUS')
+            logger.info('GAME STATUS')
             logger.record_tabular('rollout_idx', rollout_idx)
             logger.record_tabular('visited_rooms',
                                   str(len(self.visited_rooms)) + ', ' + str(self.visited_rooms))
@@ -355,16 +355,18 @@ class PPO():
         # logger
         logger.info('STATUS')
         logger.record_tabular('visited_rooms',
-                                str(len(self.visited_rooms)) + ', ' + str(self.visited_rooms))
+                              str(len(self.visited_rooms)) + ', ' + str(self.visited_rooms))
         logger.record_tabular('best_reward', self.best_reward)
         logger.record_tabular('current_best_reward', current_best_reward)
         logger.record_tabular('eplen', self.eplen)
         logger.dump_tabular()
 
+
 def main():
     # Parameters
     parser = argparse.ArgumentParser()
-    parser.add_argument('--env_name', type=str, default='MontezumaRevengeNoFrameskip-v4')
+    parser.add_argument('--env_name', type=str,
+                        default='MontezumaRevengeNoFrameskip-v4')
     parser.add_argument('--num_envs', type=int, default=32)
     parser.add_argument('--num_steps', type=int, default=128)
     parser.add_argument('--max_episode_steps', type=int, default=4500)
@@ -373,7 +375,6 @@ def main():
     parser.add_argument('--coeff_ent', type=float, default=0.001)
     parser.add_argument('--lamda', type=float, default=0.95)
     parser.add_argument('--hidden_size', type=int, default=128)
-    parser.add_argument('--memory_size', type=int, default=128)
     parser.add_argument('--enlargement', type=str, default='normal')
     parser.add_argument('--extra_hidden', type=bool, default=True)
     parser.add_argument('--update_epochs', type=int, default=4)
@@ -384,13 +385,14 @@ def main():
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--render', action='store_true', default=False)
     parser.add_argument('--train', default=True)
-    parser.add_argument('--saved_path', type=str, default='../saved/ppo_mpi')
+    parser.add_argument('--saved_path', type=str,
+                        default='../saved/ppo_multiprocess')
     args = parser.parse_args()
 
     # Enable CUDA
     use_cuda = torch.cuda.is_available()
     args.device = torch.device('cuda' if use_cuda else 'cpu')
-    torch.cuda.current_device() # fix init bug in Windows 10
+    torch.cuda.current_device()  # fix init bug in Windows 10
 
     # Set seed
     torch.manual_seed(args.seed)
@@ -404,7 +406,8 @@ def main():
         def _thunk():
             env = make_atari(args.env_name, args.max_episode_steps)
             env.seed(args.seed + rank)
-            env = Monitor(env, logger.get_dir() and os.path.join(logger.get_dir(), str(rank)), allow_early_resets=True)
+            env = Monitor(env, logger.get_dir() and os.path.join(
+                logger.get_dir(), str(rank)), allow_early_resets=True)
             return wrap_deepmind(env)
         return _thunk
 
@@ -421,6 +424,7 @@ def main():
 
     # Exit
     envs.close()
+
 
 if __name__ == '__main__':
     main()
