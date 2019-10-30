@@ -68,6 +68,7 @@ class ActorCritic(nn.Module):
 
         states = states.view(T * B, *states.shape[2:])
         states = self.conv(states)
+        states = states.view(-1, 6 ** 2 * 64)
         states = self.fc(states)
 
         states = states.view(T, B, self.hidden_size)
@@ -88,7 +89,7 @@ class ActorCritic(nn.Module):
         return torch.zeros(1, batch_size, self.hidden_size, device=self.device)
 
 
-class PPO():
+xclass PPO():
     def __init__(self, args):
         super(PPO, self).__init__()
         # saved path
