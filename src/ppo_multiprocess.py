@@ -89,7 +89,7 @@ class ActorCritic(nn.Module):
         return torch.zeros(1, batch_size, self.hidden_size, device=self.device)
 
 
-xclass PPO():
+class PPO():
     def __init__(self, args):
         super(PPO, self).__init__()
         # saved path
