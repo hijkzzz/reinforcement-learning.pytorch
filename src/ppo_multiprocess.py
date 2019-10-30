@@ -231,7 +231,7 @@ class PPO():
 
                 self.optimizer.step()
 
-                if self.training_step % 10000 == 0:
+                if self.training_step % 1000 == 0:
                     self.save_param(self.saved_path)
 
         logger.info('UPDATE')
@@ -368,9 +368,9 @@ def main():
     parser.add_argument('--num_envs', type=int, default=32)
     parser.add_argument('--num_steps', type=int, default=128)
     parser.add_argument('--max_episode_steps', type=int, default=4500)
-    parser.add_argument('--num_rollouts', type=int, default=30e3)
+    parser.add_argument('--num_rollouts', type=int, default=30000)
     parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--coeff_ent', type=float, default=1e-3)
+    parser.add_argument('--coeff_ent', type=float, default=0.001)
     parser.add_argument('--lamda', type=float, default=0.95)
     parser.add_argument('--hidden_size', type=int, default=128)
     parser.add_argument('--memory_size', type=int, default=128)

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.multiprocessing as mp
-from net import SharedAdam
+from util import SharedAdam
 import numpy as np
 import gym
 import os

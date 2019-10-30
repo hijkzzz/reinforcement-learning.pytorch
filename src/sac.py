@@ -317,7 +317,7 @@ class SAC():
             logger.record_tabular('episode_reward', episode_reward)
             logger.dump_tabular()
 
-            if i_episode % 1000 == 0:
+            if i_episode % 100 == 0:
                 logger.info('SAVE')
                 self.save_model('../saved/sac')
 
