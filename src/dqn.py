@@ -1,143 +1,205 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
+import sys
 import gym
-import matplotlib.pyplot as plt
-import copy
+import torch
+import pylab
+import random
+import numpy as np
+from collections import deque
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.autograd import Variable
+from torchvision import transforms
 
-# hyper-parameters
-BATCH_SIZE = 128
-LR = 0.01
-GAMMA = 0.90
-EPISILO = 0.9
-MEMORY_CAPACITY = 2000
-Q_NETWORK_ITERATION = 100
+EPISODES = 500
 
-env = gym.make("CartPole-v0")
-env = env.unwrapped
-NUM_ACTIONS = env.action_space.n
-NUM_STATES = env.observation_space.shape[0]
-ENV_A_SHAPE = 0 if isinstance(env.action_space.sample(), int) else env.action_space.sample.shape
-
-class Net(nn.Module):
-    """docstring for Net"""
-    def __init__(self):
-        super(Net, self).__init__()
-        self.fc1 = nn.Linear(NUM_STATES, 50)
-        self.fc1.weight.data.normal_(0,0.1)
-        self.fc2 = nn.Linear(50,30)
-        self.fc2.weight.data.normal_(0,0.1)
-        self.out = nn.Linear(30,NUM_ACTIONS)
-        self.out.weight.data.normal_(0,0.1)
-
-    def forward(self,x):
-        x = self.fc1(x)
-        x = F.relu(x)
-        x = self.fc2(x)
-        x = F.relu(x)
-        action_prob = self.out(x)
-        return action_prob
-
-class DQN():
-    """docstring for DQN"""
-    def __init__(self):
+# approximate Q function using Neural Network
+# state is input and Q Value of each action is output of network
+class DQN(nn.Module):
+    def __init__(self, state_size, action_size):
         super(DQN, self).__init__()
-        self.eval_net, self.target_net = Net(), Net()
+        self.fc = nn.Sequential(
+            nn.Linear(state_size, 24),
+            nn.ReLU(),
+            nn.Linear(24, 24),
+            nn.ReLU(),
+            nn.Linear(24, action_size)
+        )
 
-        self.learn_step_counter = 0
-        self.memory_counter = 0
-        self.memory = np.zeros((MEMORY_CAPACITY, NUM_STATES * 2 + 2))
-        # why the NUM_STATE*2 +2
-        # When we store the memory, we put the state, action, reward and next_state in the memory
-        # here reward and action is a number, state is a ndarray
-        self.optimizer = torch.optim.Adam(self.eval_net.parameters(), lr=LR)
-        self.loss_func = nn.MSELoss()
+    def forward(self, x):
+        return self.fc(x)
 
-    def choose_action(self, state):
-        state = torch.unsqueeze(torch.FloatTensor(state), 0) # get a 1D array
-        if np.random.randn() <= EPISILO:# greedy policy
-            action_value = self.eval_net.forward(state)
-            action = torch.max(action_value, 1)[1].data.numpy()
-            action = action[0] if ENV_A_SHAPE == 0 else action.reshape(ENV_A_SHAPE)
-        else: # random policy
-            action = np.random.randint(0,NUM_ACTIONS)
-            action = action if ENV_A_SHAPE ==0 else action.reshape(ENV_A_SHAPE)
-        return action
+# DQN Agent for the Cartpole
+# it uses Neural Network to approximate q function
+# and replay memory & target q network
+class DQNAgent():
+    def __init__(self, state_size, action_size):
+        # if you want to see Cartpole learning, then change to True
+        self.render = False
+        self.load_model = False
 
+        # get size of state and action
+        self.state_size = state_size
+        self.action_size = action_size
 
-    def store_transition(self, state, action, reward, next_state):
-        transition = np.hstack((state, [action, reward], next_state))
-        index = self.memory_counter % MEMORY_CAPACITY
-        self.memory[index, :] = transition
-        self.memory_counter += 1
+        # These are hyper parameters for the DQN
+        self.discount_factor = 0.99
+        self.learning_rate = 0.001
+        self.memory_size = 20000
+        self.epsilon = 1.0
+        self.epsilon_min = 0.01
+        self.explore_step = 5000
+        self.epsilon_decay = (self.epsilon - self.epsilon_min) / self.explore_step
+        self.batch_size = 64
+        self.train_start = 1000
 
+        # create replay memory using deque
+        self.memory = deque(maxlen=self.memory_size)
 
-    def learn(self):
+        # create main model and target model
+        self.model = DQN(state_size, action_size)
+        self.model.apply(self.weights_init)
+        self.target_model = DQN(state_size, action_size)
+        self.optimizer = optim.Adam(self.model.parameters(),
+                                    lr=self.learning_rate)
 
-        #update the parameters
-        if self.learn_step_counter % Q_NETWORK_ITERATION ==0:
-            self.target_net.load_state_dict(self.eval_net.state_dict())
-        self.learn_step_counter+=1
+        # initialize target model
+        self.update_target_model()
 
-        #sample batch from memory
-        sample_index = np.random.choice(MEMORY_CAPACITY, BATCH_SIZE)
-        batch_memory = self.memory[sample_index, :]
-        batch_state = torch.FloatTensor(batch_memory[:, :NUM_STATES])
-        batch_action = torch.LongTensor(batch_memory[:, NUM_STATES:NUM_STATES+1].astype(int))
-        batch_reward = torch.FloatTensor(batch_memory[:, NUM_STATES+1:NUM_STATES+2])
-        batch_next_state = torch.FloatTensor(batch_memory[:,-NUM_STATES:])
+        if self.load_model:
+            self.model = torch.load('save_model/cartpole_dqn')
 
-        #q_eval
-        q_eval = self.eval_net(batch_state).gather(1, batch_action)
-        q_next = self.target_net(batch_next_state).detach()
-        q_target = batch_reward + GAMMA * q_next.max(1)[0].view(BATCH_SIZE, 1)
-        loss = self.loss_func(q_eval, q_target)
+    # weight xavier initialize
+    def weights_init(self, m):
+        classname = m.__class__.__name__
+        if classname.find('Linear') != -1:
+            torch.nn.init.xavier_uniform(m.weight)
+
+    # after some time interval update the target model to be same with model
+    def update_target_model(self):
+        self.target_model.load_state_dict(self.model.state_dict())
+
+    #  get action from model using epsilon-greedy policy
+    def get_action(self, state):
+        if np.random.rand() <= self.epsilon:
+            return random.randrange(self.action_size)
+        else:
+            state = torch.from_numpy(state)
+            state = Variable(state).float().cpu()
+            q_value = self.model(state)
+            _, action = torch.max(q_value, 1)
+            return int(action)
+
+    # save sample <s,a,r,s'> to the replay memory
+    def append_sample(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
+
+    # pick samples randomly from replay memory (with batch_size)
+    def train_model(self):
+        if self.epsilon > self.epsilon_min:
+            self.epsilon -= self.epsilon_decay
+
+        mini_batch = random.sample(self.memory, self.batch_size)
+        mini_batch = np.array(mini_batch).transpose()
+
+        states = np.vstack(mini_batch[0])
+        actions = list(mini_batch[1])
+        rewards = list(mini_batch[2])
+        next_states = np.vstack(mini_batch[3])
+        dones = mini_batch[4]
+
+        # bool to binary
+        dones = dones.astype(int)
+
+        # Q function of current state
+        states = torch.Tensor(states)
+        states = Variable(states).float()
+        pred = self.model(states)
+
+        # one-hot encoding
+        a = torch.LongTensor(actions).view(-1, 1)
+
+        one_hot_action = torch.FloatTensor(self.batch_size, self.action_size).zero_()
+        one_hot_action.scatter_(1, a, 1)
+
+        pred = torch.sum(pred.mul(Variable(one_hot_action)), dim=1)
+
+        # Q function of next state
+        next_states = torch.Tensor(next_states)
+        next_states = Variable(next_states).float()
+        next_pred = self.target_model(next_states).data
+
+        rewards = torch.FloatTensor(rewards)
+        dones = torch.FloatTensor(dones)
+
+        # Q Learning: get maximum Q value at s' from target model
+        target = rewards + (1 - dones) * self.discount_factor * next_pred.max(1)[0]
+        target = Variable(target)
 
         self.optimizer.zero_grad()
+
+        # MSE Loss function
+        loss = F.mse_loss(pred,target)
         loss.backward()
+
+        # and train
         self.optimizer.step()
 
-def reward_func(env, x, x_dot, theta, theta_dot):
-    r1 = (env.x_threshold - abs(x))/env.x_threshold - 0.5
-    r2 = (env.theta_threshold_radians - abs(theta)) / env.theta_threshold_radians - 0.5
-    reward = r1 + r2
-    return reward
 
-def main():
-    dqn = DQN()
-    episodes = 400
-    print("Collecting Experience....")
-    reward_list = []
-    plt.ion()
-    fig, ax = plt.subplots()
-    for i in range(episodes):
+if __name__ == "__main__":
+    # In case of CartPole-v1, maximum length of episode is 500
+    env = gym.make('CartPole-v1')
+    state_size = env.observation_space.shape[0]
+    action_size = env.action_space.n
+    model = DQN(state_size, action_size)
+
+    agent = DQNAgent(state_size, action_size)
+    scores, episodes = [], []
+
+    for e in range(EPISODES):
+        done = False
+        score = 0
+
         state = env.reset()
-        ep_reward = 0
-        while True:
-            env.render()
-            action = dqn.choose_action(state)
-            next_state, _ , done, info = env.step(action)
-            x, x_dot, theta, theta_dot = next_state
-            reward = reward_func(env, x, x_dot, theta, theta_dot)
+        state = np.reshape(state, [1, state_size])
 
-            dqn.store_transition(state, action, reward, next_state)
-            ep_reward += reward
+        while not done:
+            if agent.render:
+                env.render()
 
-            if dqn.memory_counter >= MEMORY_CAPACITY:
-                dqn.learn()
-                if done:
-                    print("episode: {} , the episode reward is {}".format(i, round(ep_reward, 3)))
-            if done:
-                break
+            # get action for the current state and go one step in environment
+            action = agent.get_action(state)
+
+            next_state, reward, done, info = env.step(action)
+            next_state = np.reshape(next_state, [1, state_size])
+
+            # if an action make the episode end, then gives penalty of -100
+            reward = reward if not done or score == 499 else -10
+
+            # save the sample <s, a, r, s'> to the replay memory
+            agent.append_sample(state, action, reward, next_state, done)
+            # every time step do the training
+            if len(agent.memory) >= agent.train_start:
+                agent.train_model()
+
+            score += reward
             state = next_state
-        r = copy.copy(reward)
-        reward_list.append(r)
-        ax.set_xlim(0,300)
-        #ax.cla()
-        ax.plot(reward_list, 'g-', label='total_loss')
-        plt.pause(0.001)
-        
 
-if __name__ == '__main__':
-    main()
+            if done:
+                # every episode update the target model to be same with model
+                agent.update_target_model()
+
+                # every episode, plot the play time
+                score = score if score == 500 else score + 10
+                scores.append(score)
+                episodes.append(e)
+                pylab.plot(episodes, scores, 'b')
+                pylab.savefig("./save_graph/cartpole_dqn.png")
+                print("episode:", e, "  score:", score, "  memory length:",
+                      len(agent.memory), "  epsilon:", agent.epsilon)
+
+                # if the mean of scores of last 10 episode is bigger than 490
+                # stop training
+                if np.mean(scores[-min(10, len(scores)):]) > 490:
+                    torch.save(agent.model, "./save_model/cartpole_dqn")
+                    sys.exit()

@@ -77,3 +77,17 @@ class A2C_ACKTR():
         self.optimizer.step()
 
         return value_loss.item(), action_loss.item(), dist_entropy.item()
+
+    def train(self):
+        pass
+
+    def test(self):
+        pass
+
+
+def main():
+    pass
+
+
+if __name__ == '__main__':
+    main()
