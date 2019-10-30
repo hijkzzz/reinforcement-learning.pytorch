@@ -3,21 +3,21 @@ from mpi4py import MPI
 import os, numpy as np
 import platform
 
-def sync_from_root(sess, variables, comm=None):
-    """
-    Send the root node's parameters to every worker.
-    Arguments:
-      sess: the TensorFlow session.
-      variables: all parameter variables including optimizer's
-    """
-    if comm is None: comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    for var in variables:
-        if rank == 0:
-            comm.bcast(sess.run(var))
-        else:
-            import tensorflow as tf
-            sess.run(tf.assign(var, comm.bcast(None)))
+# def sync_from_root(sess, variables, comm=None):
+#     """
+#     Send the root node's parameters to every worker.
+#     Arguments:
+#       sess: the TensorFlow session.
+#       variables: all parameter variables including optimizer's
+#     """
+#     if comm is None: comm = MPI.COMM_WORLD
+#     rank = comm.Get_rank()
+#     for var in variables:
+#         if rank == 0:
+#             comm.bcast(sess.run(var))
+#         else:
+#             import tensorflow as tf
+#             sess.run(tf.assign(var, comm.bcast(None)))
 
 
 def get_local_rank_size(comm):
@@ -69,33 +69,33 @@ def dict_gather_mean(comm, d):
         k2mean[k] = np.mean(li, axis=0) if len(li) == size else np.nan
     return k2mean
 
-class MpiAdamOptimizer(tf.train.AdamOptimizer):
-    """Adam optimizer that averages gradients across mpi processes."""
-    def __init__(self, comm, **kwargs):
-        self.comm = comm
-        tf.train.AdamOptimizer.__init__(self, **kwargs)
-    def compute_gradients(self, loss, var_list, **kwargs):
-        grads_and_vars = tf.train.AdamOptimizer.compute_gradients(self, loss, var_list, **kwargs)
-        grads_and_vars = [(g, v) for g, v in grads_and_vars if g is not None]
-        flat_grad = tf.concat([tf.reshape(g, (-1,)) for g, v in grads_and_vars], axis=0)
-        shapes = [v.shape.as_list() for g, v in grads_and_vars]
-        sizes = [int(np.prod(s)) for s in shapes]
+# class MpiAdamOptimizer(tf.train.AdamOptimizer):
+#     """Adam optimizer that averages gradients across mpi processes."""
+#     def __init__(self, comm, **kwargs):
+#         self.comm = comm
+#         tf.train.AdamOptimizer.__init__(self, **kwargs)
+#     def compute_gradients(self, loss, var_list, **kwargs):
+#         grads_and_vars = tf.train.AdamOptimizer.compute_gradients(self, loss, var_list, **kwargs)
+#         grads_and_vars = [(g, v) for g, v in grads_and_vars if g is not None]
+#         flat_grad = tf.concat([tf.reshape(g, (-1,)) for g, v in grads_and_vars], axis=0)
+#         shapes = [v.shape.as_list() for g, v in grads_and_vars]
+#         sizes = [int(np.prod(s)) for s in shapes]
 
-        num_tasks = self.comm.Get_size()
-        buf = np.zeros(sum(sizes), np.float32)
+#         num_tasks = self.comm.Get_size()
+#         buf = np.zeros(sum(sizes), np.float32)
 
-        def _collect_grads(flat_grad):
-            self.comm.Allreduce(flat_grad, buf, op=MPI.SUM)
-            np.divide(buf, float(num_tasks), out=buf)
-            return buf
+#         def _collect_grads(flat_grad):
+#             self.comm.Allreduce(flat_grad, buf, op=MPI.SUM)
+#             np.divide(buf, float(num_tasks), out=buf)
+#             return buf
 
-        avg_flat_grad = tf.py_func(_collect_grads, [flat_grad], tf.float32)
-        avg_flat_grad.set_shape(flat_grad.shape)
-        avg_grads = tf.split(avg_flat_grad, sizes, axis=0)
-        avg_grads_and_vars = [(tf.reshape(g, v.shape), v)
-                    for g, (_, v) in zip(avg_grads, grads_and_vars)]
+#         avg_flat_grad = tf.py_func(_collect_grads, [flat_grad], tf.float32)
+#         avg_flat_grad.set_shape(flat_grad.shape)
+#         avg_grads = tf.split(avg_flat_grad, sizes, axis=0)
+#         avg_grads_and_vars = [(tf.reshape(g, v.shape), v)
+#                     for g, (_, v) in zip(avg_grads, grads_and_vars)]
 
-        return avg_grads_and_vars
+#         return avg_grads_and_vars
 
 
 def mpi_mean(x, axis=0, comm=None, keepdims=False):

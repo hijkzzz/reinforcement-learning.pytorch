@@ -1,6 +1,7 @@
 import math
 import argparse
 import itertools
+import os
 
 import torch
 import torch.nn as nn
@@ -108,6 +109,11 @@ class SAC():
     def __init__(self, num_inputs, action_space, args):
         self.args = args
 
+        self.render = args.render
+        self.saved_path = args.saved_path
+        if not os.path.exists(self.saved_path):
+            os.makedirs(self.saved_path)
+
         self.gamma = args.gamma
         self.tau = args.tau
         self.alpha = args.alpha
@@ -119,15 +125,15 @@ class SAC():
         self.device = torch.device("cuda" if use_cuda else "cpu")
 
         self.soft_q_net1 = SoftQNetwork(
-            num_inputs, action_space.shape[0], args.hidden_dim).to(self.device)
+            num_inputs, action_space.shape[0], args.hidden_size).to(self.device)
         self.soft_q_net2 = SoftQNetwork(
-            num_inputs, action_space.shape[0], args.hidden_dim).to(self.device)
+            num_inputs, action_space.shape[0], args.hidden_size).to(self.device)
         self.target_soft_q_net1 = SoftQNetwork(
-            num_inputs, action_space.shape[0], args.hidden_dim).to(self.device)
+            num_inputs, action_space.shape[0], args.hidden_size).to(self.device)
         self.target_soft_q_net2 = SoftQNetwork(
-            num_inputs, action_space.shape[0], args.hidden_dim).to(self.device)
+            num_inputs, action_space.shape[0], args.hidden_size).to(self.device)
         self.policy_net = PolicyNetwork(
-            num_inputs, action_space.shape[0], args.hidden_dim).to(self.device)
+            num_inputs, action_space.shape[0], args.hidden_size).to(self.device)
 
         hard_update(target=self.target_soft_q_net1, source=self.soft_q_net1)
         hard_update(target=self.target_soft_q_net2, source=self.soft_q_net2)
@@ -147,7 +153,9 @@ class SAC():
             self.log_alpha = torch.zeros(
                 1, requires_grad=True, device=self.device)
             self.alpha_optimizer = optim.Adam(
-                self.log_alpha.parameters(), lr=args.lr)
+                [self.log_alpha], lr=args.lr)
+
+        
 
     def select_action(self, state, eval=False):
         state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
@@ -179,8 +187,8 @@ class SAC():
             qf2_next_target = self.target_soft_q_net2(
                 next_state, next_state_action)
             min_qf_next_target = torch.min(
-                qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
-            next_q_value = reward + mask * gamma * min_qf_next_target
+                qf1_next_target, qf2_next_target) - self.alpha * next_state_log_pi
+            next_q_value = reward + mask * self.gamma * min_qf_next_target
 
         # Two Q-functions to mitigate positive bias in the policy improvement step
         qf1 = self.soft_q_net1(state, action)
@@ -249,7 +257,7 @@ class SAC():
     def train(self, env):
         args = self.args
         # Memory
-        memory = ReplayBuffer(capacity=args.replay_buffer_size)
+        memory = ReplayBuffer(capacity=args.replay_size)
 
         # Training Loop
         total_numsteps = 0
@@ -276,22 +284,21 @@ class SAC():
                             memory, args.batch_size, updates)
                         updates += 1
 
-                        logger.record_tabular('q1_loss', q1_loss)
-                        logger.record_tabular('q2_loss', q2_loss)
-                        logger.record_tabular('policy_loss', policy_loss)
-                        logger.record_tabular('alpha_loss', alpha_loss)
-                        logger.dump_tabular()
+                        if updates % 100 == 0:
+                            logger.info('updating...')
+                            logger.record_tabular('q1_loss', q1_loss)
+                            logger.record_tabular('q2_loss', q2_loss)
+                            logger.record_tabular('policy_loss', policy_loss)
+                            logger.record_tabular('alpha_loss', alpha_loss)
+                            logger.dump_tabular()
 
                 next_state, reward, done, _ = env.step(action)  # Step
                 episode_steps += 1
                 total_numsteps += 1
                 episode_reward += reward
 
-                logger.record_tabular('i_episode', i_episode)
-                logger.record_tabular('episode_steps', episode_steps)
-                logger.record_tabular('total_numsteps', total_numsteps)
-                logger.record_tabular('episode_reward', episode_reward)
-                logger.dump_tabular()
+                if self.render:
+                    env.render()
 
                 # Ignore the "done" signal if it comes from hitting the time horizon.
                 # (https://github.com/openai/spinningup/blob/master/spinup/algos/sac/sac.py)
@@ -302,14 +309,22 @@ class SAC():
 
                 state = next_state
 
-            if i_episode % 1000 == 0:
-                self.save_model('./temp')
+            logger.info('episode report')
+            logger.record_tabular('i_episode', i_episode)
+            logger.record_tabular('episode_steps', episode_steps)
+            logger.record_tabular('total_numsteps', total_numsteps)
+            logger.record_tabular('episode_reward', episode_reward)
+            logger.dump_tabular()
+
+            if i_episode % 100 == 0:
+                logger.info('saving...')
+                self.save_model('../saved/sac')
 
             if total_numsteps > args.num_steps:
                 return
 
     def test(self, env):
-        self.load_model('./temp')
+        self.load_model('../saved/sac')
 
         avg_reward = 0.
         episodes = 10
@@ -322,12 +337,15 @@ class SAC():
 
                 next_state, reward, done, _ = env.step(action)
                 episode_reward += reward
-                logger.info('episode reward %f' %(episode_reward))
+                logger.info('episode reward %f' % (episode_reward))
+
+                if self.render:
+                    env.render()
 
                 state = next_state
             avg_reward += episode_reward
         avg_reward /= episodes
-        logger.info('avg reward %f' %(avg_reward))
+        logger.info('avg reward %f' % (avg_reward))
 
 
 def soft_update(target, source, tau):
@@ -345,35 +363,37 @@ def main():
         description='PyTorch Soft Actor-Critic Args')
     parser.add_argument('--env-name', default="HalfCheetah-v2",
                         help='Mujoco Gym environment')
-    parser.add_argument('--gamma', type=float, default=0.99, metavar='G',
+    parser.add_argument('--gamma', type=float, default=0.99,
                         help='discount factor for reward ')
-    parser.add_argument('   --tau', type=float, default=0.005, metavar='G',
+    parser.add_argument('--tau', type=float, default=0.005,
                         help='target smoothing coefficient(τ) ')
-    parser.add_argument('--lr', type=float, default=0.0003, metavar='G',
+    parser.add_argument('--lr', type=float, default=0.0003,
                         help='learning rate ')
-    parser.add_argument('--alpha', type=float, default=0.2, metavar='G',
+    parser.add_argument('--alpha', type=float, default=0.2,
                         help='Temperature parameter α determines the relative importance of the entropy\
                                 term against the reward')
-    parser.add_argument('--automatic_entropy_tuning', type=bool, default=False, metavar='G',
+    parser.add_argument('--automatic_entropy_tuning', type=bool, default=True,
                         help='Automaically adjust α')
-    parser.add_argument('--seed', type=int, default=123456, metavar='N',
+    parser.add_argument('--seed', type=int, default=123456,
                         help='random seed')
-    parser.add_argument('--batch_size', type=int, default=256, metavar='N',
+    parser.add_argument('--batch_size', type=int, default=256,
                         help='batch size')
-    parser.add_argument('--num_steps', type=int, default=1000000, metavar='N',
+    parser.add_argument('--num_steps', type=int, default=1000000,
                         help='maximum number of steps')
-    parser.add_argument('--hidden_size', type=int, default=256, metavar='N',
+    parser.add_argument('--hidden_size', type=int, default=256,
                         help='hidden size')
-    parser.add_argument('--updates_per_step', type=int, default=1, metavar='N',
+    parser.add_argument('--updates_per_step', type=int, default=1,
                         help='model updates per simulator step')
-    parser.add_argument('--start_steps', type=int, default=10000, metavar='N',
+    parser.add_argument('--start_steps', type=int, default=10000,
                         help='Steps sampling random actions')
-    parser.add_argument('--target_update_interval', type=int, default=1, metavar='N',
+    parser.add_argument('--target_update_interval', type=int, default=1,
                         help='Value target update per no. of updates per step')
-    parser.add_argument('--replay_size', type=int, default=1000000, metavar='N',
+    parser.add_argument('--replay_size', type=int, default=1000000,
                         help='size of replay buffer')
     parser.add_argument('--train', type=bool, default=True,
-                    help='Train a policy')
+                        help='Train a policy')
+    parser.add_argument('--render', action='store_true', default=False)
+    parser.add_argument('--saved_path', type=str, default='../saved/sac')
     args = parser.parse_args()
 
     # Environment
@@ -388,9 +408,10 @@ def main():
     if args.train:
         agent.train(env)
     else:
-        agent.test(env)   
+        agent.test(env)
 
     env.close()
+
 
 if __name__ == '__main__':
     main()
