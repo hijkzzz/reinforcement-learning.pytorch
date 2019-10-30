@@ -47,8 +47,6 @@ class ActorCritic(nn.Module):
             nn.ReLU()
         )
 
-        self.gru = nn.GRU(input_size=hidden_size, hidden_size=hidden_size)
-
         if self.extra_hidden:
             self.fc2val = nn.Sequential(nn.Linear(hidden_size, hidden_size),
                                         nn.ReLU())
@@ -59,20 +57,13 @@ class ActorCritic(nn.Module):
                                     nn.Softmax(dim=1))
         self.value = nn.Linear(hidden_size, 1)
 
-    def forward(self, states, hiddens=None):
-        T = states.shape[0]
-        B = states.shape[1]
+    def forward(self, states):
+        nsteps, nenvs = states.shape[:2]
 
-        if hiddens is None:
-            hiddens = self.init_hidden(B)
-
-        states = states.view(T * B, *states.shape[2:])
+        states = states.view(-1, *states.shape[2:])
         states = self.conv(states)
-        states = states.view(-1, 6 ** 2 * 64)
+        states = states.view(nsteps, nenvs, 6 ** 2 * 64)
         states = self.fc(states)
-
-        states = states.view(T, B, self.hidden_size)
-        states, hiddens = self.gru(states, hiddens)
 
         value = probs = states
         if self.extra_hidden:
@@ -83,10 +74,7 @@ class ActorCritic(nn.Module):
         dist = Categorical(probs)
         value = self.value(value)
 
-        return dist, torch.log(probs), value, hiddens
-
-    def init_hidden(self, batch_size):
-        return torch.zeros(1, batch_size, self.hidden_size, device=self.device)
+        return dist, torch.log(probs), value
 
 
 class PPO():
@@ -104,7 +92,6 @@ class PPO():
         self.actor_critic.apply(init_orthogonal_)
 
         # args
-        self.args = args
         self.device = args.device
         self.num_steps = args.num_steps
         self.num_envs = args.num_envs
@@ -125,20 +112,19 @@ class PPO():
             self.actor_critic.parameters(), args.learning_rate)
 
         # batch
-        self.num_batch = self.num_steps * self.num_envs // self.batch_size
-        self.stride_batch = self.num_envs // self.num_batch
+        self.batch_num = self.num_steps * self.num_envs // self.batch_size
+        self.batch_stride = self.num_envs // self.batch_num
 
-    def select_action(self, states, hiddens):
-        # H * W * C ==> C * H * W
+    def select_action(self, states):
+        # 1 * B * features
         states = torch.from_numpy(states).unsqueeze(0).to(
             device=self.device, dtype=torch.float32)
 
         with torch.no_grad():
-            dist, _, _, hiddens = self.actor_critic(
-                states, hiddens)
+            dist, _, _ = self.actor_critic(states)
         action = dist.sample()
         log_prob = dist.log_prob(action)
-        return action[0].cpu().tolist(), log_prob[0].cpu().numpy(), hiddens
+        return action[0].cpu().tolist(), log_prob[0].cpu().numpy()
 
     def save_param(self, path):
         logger.info('SAVE')
@@ -166,17 +152,17 @@ class PPO():
         # GENERALIZED ADVANTAGE ESTIMATION
         with torch.no_grad():
             advantages = torch.zeros_like(rewards)
-            _, _, values, _ = self.actor_critic(
-                torch.cat([states, next_states[-1].unsqueeze(0)], dim=0))
+            _, _, values = self.actor_critic(torch.cat([states, next_states[-1].unsqueeze(0)], dim=0))
             values = values.squeeze(2)  # remove last dimension
 
             last_gae_lam = 0
             for t in range(self.num_steps - 1, -1, -1):
-                delta = rewards[t] + self.gamma * \
-                    masks[t] * values[t + 1] - values[t]
+                delta = rewards[t] + masks[t] * \
+                    self.gamma * values[t + 1] - values[t]
+                advantages[t, :] = delta + masks[t] * \
+                    self.lamda * self.gamma * last_gae_lam
+                last_gae_lam = advantages[t]
 
-                advantages[t, :] = last_gae_lam = delta + \
-                    self.lamda * self.gamma * masks[t] * last_gae_lam
             returns = advantages + values[:-1]
 
         logger.info('GENERALIZED ADVANTAGE ESTIMATION')
@@ -190,22 +176,21 @@ class PPO():
 
         # train epochs
         for epoch_idx in range(self.update_epochs):
-            for batch_idx in range(self.num_batch):
+            for batch_idx in range(self.batch_num):
                 self.training_step += 1
                 # samples in batch
                 # T * B * features
                 start, end = batch_idx * \
-                    self.stride_batch, (batch_idx + 1) * self.stride_batch
+                    self.batch_stride, (batch_idx + 1) * self.batch_stride
 
                 state = states[:, start:end, ...].contiguous()
                 action = actions[:, start:end, ...]
                 old_action_log_prob = old_action_log_probs[:, start:end, ...]
-                return1 = returns[:, start:end, ...]
+                retur = returns[:, start:end, ...]
                 advantage = advantages[:, start:end, ...]
 
                 # policy loss
-                dist, _, value, _ = self.actor_critic(
-                    state)
+                dist, _, value = self.actor_critic(state)
                 action_log_prob = dist.log_prob(action)
 
                 ratio = torch.exp(action_log_prob - old_action_log_prob)
@@ -216,7 +201,7 @@ class PPO():
 
                 # value loss
                 smooth_l1_loss = nn.SmoothL1Loss(reduction='mean')
-                value_loss = smooth_l1_loss(return1.flatten(), value.flatten())
+                value_loss = smooth_l1_loss(retur.flatten(), value.flatten())
 
                 # entropy loss
                 entropy_loss = -torch.mean(dist.entropy(), dim=(0, 1))
@@ -252,7 +237,6 @@ class PPO():
 
         rollout_idx = 0
         state = np.transpose(envs.reset(), (0, 3, 1, 2))
-        hidden = self.actor_critic.init_hidden(self.num_envs)
 
         # rollout
         while rollout_idx < self.num_rollouts:
@@ -269,8 +253,7 @@ class PPO():
             dones = np.zeros((self.num_steps, self.num_envs), np.int32)
 
             for t in range(self.num_steps):
-                action, action_log_prob, hidden = self.select_action(
-                    state, hidden)
+                action, action_log_prob = self.select_action(state)
                 next_state, reward, done, info = envs.step(action)
                 # TensorFlow format to PyTorch
                 next_state = np.transpose(next_state, (0, 3, 1, 2))

@@ -113,17 +113,20 @@ class SAC():
             os.makedirs(self.saved_path)
 
         # args
-        self.args = args
         self.render = args.render
         self.gamma = args.gamma
         self.tau = args.tau
         self.alpha = args.alpha
+        self.replay_size = args.replay_size
+        self.start_steps = args.start_steps
+        self.batch_size = args.batch_size
+        self.updates_per_step = args.updates_per_step
+        self.num_steps = args.num_steps
 
         self.target_update_interval = args.target_update_interval
         self.automatic_entropy_tuning = args.automatic_entropy_tuning
 
-        use_cuda = torch.cuda.is_available()
-        self.device = torch.device("cuda" if use_cuda else "cpu")
+        self.device = args.device
 
         # networks
         self.soft_q_net1 = SoftQNetwork(
@@ -257,9 +260,8 @@ class SAC():
         self.policy_net.eval()
 
     def train(self, env):
-        args = self.args
         # Memory
-        memory = ReplayBuffer(capacity=args.replay_size)
+        memory = ReplayBuffer(capacity=self.replay_size)
 
         # Training Loop
         total_numsteps = 0
@@ -272,18 +274,18 @@ class SAC():
             state = env.reset()
 
             while not done:
-                if total_numsteps < args.start_steps:
+                if total_numsteps < self.start_steps:
                     action = env.action_space.sample()  # Sample random action
                 else:
                     # Sample action from policy
                     action = self.select_action(state)
 
-                if len(memory) > args.batch_size:
+                if len(memory) > self.batch_size:
                     # Number of updates per step in environment
-                    for i in range(args.updates_per_step):
+                    for i in range(self.updates_per_step):
                         # Update parameters of all the networks
                         q1_loss, q2_loss, policy_loss, alpha_loss = self.update_parameters(
-                            memory, args.batch_size, updates)
+                            memory, self.batch_size, updates)
                         updates += 1
 
                 next_state, reward, done, _ = env.step(action)  # Step
@@ -321,7 +323,7 @@ class SAC():
                 logger.info('SAVE')
                 self.save_model('../saved/sac')
 
-            if total_numsteps > args.num_steps:
+            if total_numsteps > self.num_steps:
                 return
 
     def test(self, env):
@@ -396,6 +398,10 @@ def main():
     parser.add_argument('--render', action='store_true', default=False)
     parser.add_argument('--saved_path', type=str, default='../saved/sac')
     args = parser.parse_args()
+
+    # CUDA
+    use_cuda = torch.cuda.is_available()
+    args.device = torch.device("cuda" if use_cuda else "cpu")
 
     # Environment
     # env = NormalizedActions(gym.make(args.env_name))
