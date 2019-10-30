@@ -303,14 +303,14 @@ class SAC():
 
                 state = next_state
 
-            logger.info('update parameters')
+            logger.info('UPDATE')
             logger.record_tabular('q1_loss', q1_loss)
             logger.record_tabular('q2_loss', q2_loss)
             logger.record_tabular('policy_loss', policy_loss)
             logger.record_tabular('alpha_loss', alpha_loss)
             logger.dump_tabular()
 
-            logger.info('episode status')
+            logger.info('STATUS')
             logger.record_tabular('i_episode', i_episode)
             logger.record_tabular('episode_steps', episode_steps)
             logger.record_tabular('total_numsteps', total_numsteps)
@@ -318,7 +318,7 @@ class SAC():
             logger.dump_tabular()
 
             if i_episode % 1000 == 0:
-                logger.info('save models')
+                logger.info('SAVE')
                 self.save_model('../saved/sac')
 
             if total_numsteps > args.num_steps:

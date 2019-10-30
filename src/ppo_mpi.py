@@ -10,13 +10,12 @@ from torch import nn
 from torch import optim
 from torch.distributions import Categorical
 
-from env import SubprocVecEnv
-from env import make_atari, wrap_deepmind
-from env import Monitor
-
 from util import init_orthogonal_
 from util import logger
 
+from env import SubprocVecEnv
+from env import make_atari, wrap_deepmind
+from env import Monitor
 
 class ActorCritic(nn.Module):
     def __init__(self, action_size, hidden_size=128, memory_size=128, extra_hidden=True, enlargement='normal', device=torch.device('cuda')):
@@ -141,6 +140,7 @@ class PPO():
         return action[0].cpu().tolist(), log_prob[0].cpu().numpy(), hiddens
 
     def save_param(self, path):
+        logger.info('SAVE')
         torch.save(self.actor_critic.state_dict(),
                    path + '/actor_critic.pkl')
 
@@ -178,7 +178,7 @@ class PPO():
                     self.lamda * self.gamma * masks[t] * last_gae_lam
             returns = advantages + values[:-1]
 
-        logger.info('GAE stastics')
+        logger.info('GENERALIZED ADVANTAGE ESTIMATION')
         logger.record_tabular('advantages mean', advantages.mean(dim=(0, 1)))
         logger.record_tabular('advantages std', advantages.std(dim=(0, 1)))
         logger.record_tabular('returns mean',
@@ -218,10 +218,10 @@ class PPO():
                 value_loss = smooth_l1_loss(return1.flatten(), value.flatten())
 
                 # entropy loss
-                entropy = -torch.mean(dist.entropy(), dim=(0, 1))
+                entropy_loss = -torch.mean(dist.entropy(), dim=(0, 1))
 
                 # backprop
-                loss = action_loss + value_loss + self.coeff_ent * entropy
+                loss = action_loss + value_loss + self.coeff_ent * entropy_loss
                 self.optimizer.zero_grad()
                 loss.backward()
 
@@ -234,14 +234,14 @@ class PPO():
                 if self.training_step % 10000 == 0:
                     self.save_param(self.saved_path)
 
-            logger.info('update parameters')
-            logger.record_tabular('training_step',
-                self.training_step)
-            logger.record_tabular('value_loss',
-                                    value_loss.item())
-            logger.record_tabular('policy_loss', action_loss.item())
-            logger.record_tabular('entropy', entropy.item())
-            logger.dump_tabular()
+        logger.info('UPDATE')
+        logger.record_tabular('training_step',
+            self.training_step)
+        logger.record_tabular('value_loss',
+                                value_loss.item())
+        logger.record_tabular('policy_loss', action_loss.item())
+        logger.record_tabular('entropy_loss', entropy_loss.item())
+        logger.dump_tabular()
 
     def train(self, envs):
         self.training_step = 0
@@ -290,8 +290,6 @@ class PPO():
                 # done
                 for i, dne in enumerate(done):
                     if dne:
-                        hidden[0][i] *= 0
-
                         epinfo = info[i]['episode']
                         if 'visited_rooms' in epinfo:
                             self.visited_rooms.union(
@@ -303,7 +301,7 @@ class PPO():
                         self.eplen += epinfo['l']
 
             # logger
-            logger.info('episode status')
+            logger.info('STATUS')
             logger.record_tabular('rollout_idx', rollout_idx)
             logger.record_tabular('visited_rooms',
                                   str(len(self.visited_rooms)) + ', ' + str(self.visited_rooms))
@@ -355,7 +353,7 @@ class PPO():
                     self.eplen += epinfo['l']
 
         # logger
-        logger.info('episode report')
+        logger.info('STATUS')
         logger.record_tabular('visited_rooms',
                                 str(len(self.visited_rooms)) + ', ' + str(self.visited_rooms))
         logger.record_tabular('best_reward', self.best_reward)
