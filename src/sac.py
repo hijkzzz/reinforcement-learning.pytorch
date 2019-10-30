@@ -107,13 +107,14 @@ class PolicyNetwork(nn.Module):
 
 class SAC():
     def __init__(self, num_inputs, action_space, args):
-        self.args = args
-
-        self.render = args.render
+        # saved path
         self.saved_path = args.saved_path
         if not os.path.exists(self.saved_path):
             os.makedirs(self.saved_path)
 
+        # args
+        self.args = args
+        self.render = args.render
         self.gamma = args.gamma
         self.tau = args.tau
         self.alpha = args.alpha
@@ -124,6 +125,7 @@ class SAC():
         use_cuda = torch.cuda.is_available()
         self.device = torch.device("cuda" if use_cuda else "cpu")
 
+        # networks
         self.soft_q_net1 = SoftQNetwork(
             num_inputs, action_space.shape[0], args.hidden_size).to(self.device)
         self.soft_q_net2 = SoftQNetwork(
@@ -284,14 +286,6 @@ class SAC():
                             memory, args.batch_size, updates)
                         updates += 1
 
-                        if updates % 100 == 0:
-                            logger.info('updating...')
-                            logger.record_tabular('q1_loss', q1_loss)
-                            logger.record_tabular('q2_loss', q2_loss)
-                            logger.record_tabular('policy_loss', policy_loss)
-                            logger.record_tabular('alpha_loss', alpha_loss)
-                            logger.dump_tabular()
-
                 next_state, reward, done, _ = env.step(action)  # Step
                 episode_steps += 1
                 total_numsteps += 1
@@ -309,15 +303,22 @@ class SAC():
 
                 state = next_state
 
-            logger.info('episode report')
+            logger.info('update parameters')
+            logger.record_tabular('q1_loss', q1_loss)
+            logger.record_tabular('q2_loss', q2_loss)
+            logger.record_tabular('policy_loss', policy_loss)
+            logger.record_tabular('alpha_loss', alpha_loss)
+            logger.dump_tabular()
+
+            logger.info('episode status')
             logger.record_tabular('i_episode', i_episode)
             logger.record_tabular('episode_steps', episode_steps)
             logger.record_tabular('total_numsteps', total_numsteps)
             logger.record_tabular('episode_reward', episode_reward)
             logger.dump_tabular()
 
-            if i_episode % 100 == 0:
-                logger.info('saving...')
+            if i_episode % 1000 == 0:
+                logger.info('save models')
                 self.save_model('../saved/sac')
 
             if total_numsteps > args.num_steps:

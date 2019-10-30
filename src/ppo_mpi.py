@@ -48,7 +48,7 @@ class ActorCritic(nn.Module):
             nn.ReLU()
         )
 
-        self.rnn = nn.GRUCell(hidden_size, memory_size)
+        self.gru = nn.GRU(input_size=hidden_size, hidden_size=memory_size)
 
         if self.extra_hidden:
             self.fc2val = nn.Sequential(nn.Linear(memory_size, memory_size),
@@ -72,7 +72,7 @@ class ActorCritic(nn.Module):
         states = states.view(T, B, 6 ** 2 * 64)
         states = self.fc(states)
 
-        states, hiddens = self.rnn(states, hiddens)
+        states, hiddens = self.gru(states, hiddens)
 
         value = probs = states
         if self.extra_hidden:
@@ -92,6 +92,11 @@ class ActorCritic(nn.Module):
 class PPO():
     def __init__(self, args):
         super(PPO, self).__init__()
+        # saved path
+        self.saved_path = args.saved_path
+        if not os.path.exists(self.saved_path):
+            os.makedirs(self.saved_path)
+
         # neural networks
         self.actor_critic = ActorCritic(action_size=args.action_size, hidden_size=args.hidden_size,
                                         memory_size=args.memory_size, extra_hidden=args.extra_hidden,
@@ -99,6 +104,7 @@ class PPO():
         self.actor_critic.apply(init_orthogonal_)
 
         # args
+        self.args = args
         self.device = args.device
         self.num_steps = args.num_steps
         self.num_envs = args.num_envs
@@ -129,7 +135,7 @@ class PPO():
 
         with torch.no_grad():
             dist, _, _, hiddens = self.actor_critic(
-                states, hiddens)
+                states, hiddens) 
         action = dist.sample()
         log_prob = dist.log_prob(action)
         return action[0].cpu().tolist(), log_prob[0].cpu().numpy(), hiddens
@@ -161,15 +167,18 @@ class PPO():
             advantages = torch.zeros_like(rewards)
             _, _, values, _ = self.actor_critic(
                 torch.cat([states, next_states[-1].unsqueeze(0)], dim=0))
+            values = values.squeeze(2) # remove last dimension
 
             last_gae_lam = 0
             for t in range(self.num_steps - 1, -1, -1):
                 delta = rewards[t] + self.gamma * \
                     masks[t] * values[t + 1] - values[t]
+
                 advantages[t, :] = last_gae_lam = delta + \
                     self.lamda * self.gamma * masks[t] * last_gae_lam
             returns = advantages + values[:-1]
 
+        logger.info('GAE stastics')
         logger.record_tabular('advantages mean', advantages.mean(dim=(0, 1)))
         logger.record_tabular('advantages std', advantages.std(dim=(0, 1)))
         logger.record_tabular('returns mean',
@@ -180,15 +189,14 @@ class PPO():
 
         # train epochs
         for epoch_idx in range(self.update_epochs):
-            self.training_step += 1
-
             for batch_idx in range(self.num_batch):
+                self.training_step += 1
                 # samples in batch
                 # T * B * features
                 start, end = batch_idx * \
                     self.stride_batch, (batch_idx + 1) * self.stride_batch
 
-                state = states[:, start:end, ...]
+                state = states[:, start:end, ...].contiguous()
                 action = actions[:, start:end, ...]
                 old_action_log_prob = old_action_log_probs[:, start:end, ...]
                 return1 = returns[:, start:end, ...]
@@ -223,14 +231,17 @@ class PPO():
 
                 self.optimizer.step()
 
-                if epoch_idx == self.update_epochs - 1:
-                    logger.record_tabular('training_step',
-                        self.training_step)
-                    logger.record_tabular('value_loss',
-                                          value_loss.item())
-                    logger.record_tabular('policy_loss', action_loss.item())
-                    logger.record_tabular('entropy', entropy.item())
-                    logger.dump_tabular()
+                if self.training_step % 10000 == 0:
+                    self.save_param(self.saved_path)
+
+            logger.info('update parameters')
+            logger.record_tabular('training_step',
+                self.training_step)
+            logger.record_tabular('value_loss',
+                                    value_loss.item())
+            logger.record_tabular('policy_loss', action_loss.item())
+            logger.record_tabular('entropy', entropy.item())
+            logger.dump_tabular()
 
     def train(self, envs):
         self.training_step = 0
@@ -239,7 +250,7 @@ class PPO():
         self.eplen = 0
 
         rollout_idx = 0
-        state = np.transpose(envs.reset(), (0, 2, 3, 1)) / 255.0
+        state = np.transpose(envs.reset(), (0, 3, 1, 2))
         hidden = self.actor_critic.init_hidden(self.num_envs)
 
         # rollout
@@ -261,7 +272,7 @@ class PPO():
                     state, hidden)
                 next_state, reward, done, info = envs.step(action)
                 # TensorFlow format to PyTorch
-                next_state = np.transpose(next_state, (0, 2, 3, 1)) / 255.0
+                next_state = np.transpose(next_state, (0, 3, 1, 2))
 
                 # transitions
                 states[t, ...] = state
@@ -292,6 +303,8 @@ class PPO():
                         self.eplen += epinfo['l']
 
             # logger
+            logger.info('episode status')
+            logger.record_tabular('rollout_idx', rollout_idx)
             logger.record_tabular('visited_rooms',
                                   str(len(self.visited_rooms)) + ', ' + str(self.visited_rooms))
             logger.record_tabular('best_reward', self.best_reward)
@@ -342,6 +355,7 @@ class PPO():
                     self.eplen += epinfo['l']
 
         # logger
+        logger.info('episode report')
         logger.record_tabular('visited_rooms',
                                 str(len(self.visited_rooms)) + ', ' + str(self.visited_rooms))
         logger.record_tabular('best_reward', self.best_reward)
@@ -372,6 +386,7 @@ def main():
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--render', action='store_true', default=False)
     parser.add_argument('--train', default=True)
+    parser.add_argument('--saved_path', type=str, default='../saved/ppo_mpi')
     args = parser.parse_args()
 
     # Enable CUDA
