@@ -10,16 +10,15 @@ from torch import nn
 from torch import optim
 from torch.distributions import Categorical
 
-from util import init_orthogonal_
-from util import logger
-
 from env import SubprocVecEnv
 from env import make_atari, wrap_deepmind
 from env import Monitor
+from util import logger
+from util import init_orthogonal_
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, action_size, hidden_size=128, extra_hidden=True, enlargement='normal', device=torch.device('cuda')):
+    def __init__(self, action_size, hidden_size=128, extra_hidden=True, enlargement='normal', recurrent=True, device=torch.device('cuda')):
         super(ActorCritic, self).__init__()
 
         enlargement = {
@@ -47,6 +46,10 @@ class ActorCritic(nn.Module):
             nn.ReLU()
         )
 
+        self.recurrent = recurrent
+        if self.recurrent:
+            self.gru = nn.GRU(hidden_size, hidden_size)
+
         if self.extra_hidden:
             self.fc2val = nn.Sequential(nn.Linear(hidden_size, hidden_size),
                                         nn.ReLU())
@@ -57,13 +60,16 @@ class ActorCritic(nn.Module):
                                     nn.Softmax(dim=1))
         self.value = nn.Linear(hidden_size, 1)
 
-    def forward(self, states):
+    def forward(self, states, hidden=None):
         nsteps, nenvs = states.shape[:2]
 
         states = states.view(-1, *states.shape[2:])
         states = self.conv(states)
         states = states.view(nsteps, nenvs, 6 ** 2 * 64)
         states = self.fc(states)
+
+        if self.recurrent:
+            states, hidden = self.gru(states, hidden)
 
         value = probs = states
         if self.extra_hidden:
@@ -74,7 +80,7 @@ class ActorCritic(nn.Module):
         dist = Categorical(probs)
         value = self.value(value)
 
-        return dist, torch.log(probs), value
+        return dist, value, hidden
 
 
 class PPO():
@@ -87,10 +93,8 @@ class PPO():
 
         # neural networks
         self.actor_critic = ActorCritic(action_size=args.action_size, hidden_size=args.hidden_size,
-                                        extra_hidden=args.extra_hidden,
-                                        enlargement=args.enlargement, device=args.device).cuda()
-        self.actor_critic.apply(init_orthogonal_)
-
+                                        extra_hidden=args.extra_hidden, enlargement=args.enlargement, 
+                                        recurrent=args.recurrent, device=args.device).cuda()
         # args
         self.device = args.device
         self.num_steps = args.num_steps
@@ -112,19 +116,18 @@ class PPO():
             self.actor_critic.parameters(), args.learning_rate)
 
         # batch
-        self.batch_num = self.num_steps * self.num_envs // self.batch_size
-        self.batch_stride = self.num_envs // self.batch_num
+        self.sample_envs = self.batch_size // self.num_steps
 
-    def select_action(self, states):
+    def select_action(self, states, hidden=None):
         # 1 * B * features
         states = torch.from_numpy(states).unsqueeze(0).to(
             device=self.device, dtype=torch.float32)
 
         with torch.no_grad():
-            dist, _, _ = self.actor_critic(states)
+            dist, _, hidden = self.actor_critic(states, hidden)
         action = dist.sample()
         log_prob = dist.log_prob(action)
-        return action[0].cpu().tolist(), log_prob[0].cpu().numpy()
+        return action[0].cpu().tolist(), log_prob[0].cpu().numpy(), hidden
 
     def save_param(self, path):
         logger.info('SAVE')
@@ -152,7 +155,8 @@ class PPO():
         # GENERALIZED ADVANTAGE ESTIMATION
         with torch.no_grad():
             advantages = torch.zeros_like(rewards)
-            _, _, values = self.actor_critic(torch.cat([states, next_states[-1].unsqueeze(0)], dim=0))
+            _, values, _ = self.actor_critic(
+                torch.cat([states, next_states[-1].unsqueeze(0)], dim=0))
             values = values.squeeze(2)  # remove last dimension
 
             last_gae_lam = 0
@@ -176,49 +180,46 @@ class PPO():
 
         # train epochs
         for epoch_idx in range(self.update_epochs):
-            for batch_idx in range(self.batch_num):
-                self.training_step += 1
-                # samples in batch
-                # T * B * features
-                start, end = batch_idx * \
-                    self.batch_stride, (batch_idx + 1) * self.batch_stride
+            self.training_step += 1
+            # sample (T * B * features)
+            slic = random.sample(list(range(self.num_envs)), self.sample_envs)
 
-                state = states[:, start:end, ...].contiguous()
-                action = actions[:, start:end, ...]
-                old_action_log_prob = old_action_log_probs[:, start:end, ...]
-                retur = returns[:, start:end, ...]
-                advantage = advantages[:, start:end, ...]
+            state = states[:, slic, ...].contiguous()
+            action = actions[:, slic, ...]
+            old_action_log_prob = old_action_log_probs[:, slic, ...]
+            retur = returns[:, slic, ...]
+            advantage = advantages[:, slic, ...]
 
-                # policy loss
-                dist, _, value = self.actor_critic(state)
-                action_log_prob = dist.log_prob(action)
+            # policy loss
+            dist, value, _ = self.actor_critic(state)
+            action_log_prob = dist.log_prob(action)
 
-                ratio = torch.exp(action_log_prob - old_action_log_prob)
-                surr1 = ratio * advantage
-                surr2 = torch.clamp(ratio, 1.0 - self.clip_range,
-                                    1.0 + self.clip_range) * advantage
-                action_loss = -torch.mean(torch.min(surr1, surr2), dim=(0, 1))
+            ratio = torch.exp(action_log_prob - old_action_log_prob)
+            surr1 = ratio * advantage
+            surr2 = torch.clamp(ratio, 1.0 - self.clip_range,
+                                1.0 + self.clip_range) * advantage
+            action_loss = -torch.mean(torch.min(surr1, surr2), dim=(0, 1))
 
-                # value loss
-                smooth_l1_loss = nn.SmoothL1Loss(reduction='mean')
-                value_loss = smooth_l1_loss(retur.flatten(), value.flatten())
+            # value loss
+            smooth_l1_loss = nn.SmoothL1Loss(reduction='mean')
+            value_loss = smooth_l1_loss(retur.flatten(), value.flatten())
 
-                # entropy loss
-                entropy_loss = -torch.mean(dist.entropy(), dim=(0, 1))
+            # entropy loss
+            entropy_loss = -torch.mean(dist.entropy(), dim=(0, 1))
 
-                # backprop
-                loss = action_loss + value_loss + self.coeff_ent * entropy_loss
-                self.optimizer.zero_grad()
-                loss.backward()
+            # backprop
+            loss = action_loss + value_loss + self.coeff_ent * entropy_loss
+            self.optimizer.zero_grad()
+            loss.backward()
 
-                if self.max_grad_norm > 1e-8:
-                    nn.utils.clip_grad_norm_(
-                        self.actor_critic.parameters(), self.max_grad_norm)
+            if self.max_grad_norm > 1e-8:
+                nn.utils.clip_grad_norm_(
+                    self.actor_critic.parameters(), self.max_grad_norm)
 
-                self.optimizer.step()
+            self.optimizer.step()
 
-                if self.training_step % 1000 == 0:
-                    self.save_param(self.saved_path)
+            if self.training_step % 1000 == 0:
+                self.save_param(self.saved_path)
 
         logger.info('UPDATE')
         logger.record_tabular('training_step',
@@ -240,8 +241,6 @@ class PPO():
 
         # rollout
         while rollout_idx < self.num_rollouts:
-            current_best_reward = 0
-
             states = np.zeros(
                 (self.num_steps, self.num_envs, 1, 84, 84), np.float32)
             actions = np.zeros((self.num_steps, self.num_envs), np.int32)
@@ -252,8 +251,12 @@ class PPO():
                 (self.num_steps, self.num_envs, 1, 84, 84), np.float32)
             dones = np.zeros((self.num_steps, self.num_envs), np.int32)
 
+            current_best_reward = 0
+            hidden = None
+
             for t in range(self.num_steps):
-                action, action_log_prob = self.select_action(state)
+                action, action_log_prob, hidden = self.select_action(
+                    state, hidden)
                 next_state, reward, done, info = envs.step(action)
                 # TensorFlow format to PyTorch
                 next_state = np.transpose(next_state, (0, 3, 1, 2))
@@ -268,7 +271,6 @@ class PPO():
 
                 if self.render:
                     envs.render(0)
-
                 state = next_state
 
                 # done
@@ -307,43 +309,44 @@ class PPO():
 
         rollout_idx = 0
         state = np.transpose(envs.reset(), (0, 2, 3, 1)) / 255.0
-        hidden = self.actor_critic.init_hidden(self.num_envs)
 
         # rollout
         while rollout_idx < self.num_rollouts:
             current_best_reward = 0
+            hidden = None
 
-            action, _, hidden = self.select_action(
-                state, hidden)
-            next_state, reward, done, info = envs.step(action)
-            # TensorFlow format to PyTorch
-            next_state = np.transpose(next_state, (0, 2, 3, 1)) / 255.0
-            envs.render(0)
-            state = next_state
+            for t in range(self.num_steps):
+                action, _, hidden = self.select_action(state)
+                next_state, reward, done, info = envs.step(action)
+                # TensorFlow format to PyTorch
+                next_state = np.transpose(next_state, (0, 2, 3, 1)) / 255.0
 
-            # done
-            for i, dne in enumerate(done):
-                if dne:
-                    hidden[0][i] *= 0
+                envs.render(0)
+                state = next_state
 
-                    epinfo = info[i]['episode']
-                    if 'visited_rooms' in epinfo:
-                        self.visited_rooms.union(
-                            list(epinfo['visited_rooms']))
+                # done
+                for i, dne in enumerate(done):
+                    if dne:
+                        hidden[0][i] *= 0
 
-                    self.best_reward = max(epinfo['r'], self.best_reward)
-                    current_best_reward = max(
-                        epinfo['r'], current_best_reward)
-                    self.eplen += epinfo['l']
+                        epinfo = info[i]['episode']
+                        if 'visited_rooms' in epinfo:
+                            self.visited_rooms.union(
+                                list(epinfo['visited_rooms']))
 
-        # logger
-        logger.info('STATUS')
-        logger.record_tabular('visited_rooms',
-                              str(len(self.visited_rooms)) + ', ' + str(self.visited_rooms))
-        logger.record_tabular('best_reward', self.best_reward)
-        logger.record_tabular('current_best_reward', current_best_reward)
-        logger.record_tabular('eplen', self.eplen)
-        logger.dump_tabular()
+                        self.best_reward = max(epinfo['r'], self.best_reward)
+                        current_best_reward = max(
+                            epinfo['r'], current_best_reward)
+                        self.eplen += epinfo['l']
+
+            # logger
+            logger.info('GAME STATUS')
+            logger.record_tabular('visited_rooms',
+                                  str(len(self.visited_rooms)) + ', ' + str(self.visited_rooms))
+            logger.record_tabular('best_reward', self.best_reward)
+            logger.record_tabular('current_best_reward', current_best_reward)
+            logger.record_tabular('eplen', self.eplen)
+            logger.dump_tabular()
 
 
 def main():
@@ -357,18 +360,19 @@ def main():
     parser.add_argument('--num_rollouts', type=int, default=30000)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--coeff_ent', type=float, default=0.001)
+    parser.add_argument('--recurrent', type=bool, default=True)
     parser.add_argument('--lamda', type=float, default=0.95)
     parser.add_argument('--hidden_size', type=int, default=128)
     parser.add_argument('--enlargement', type=str, default='normal')
     parser.add_argument('--extra_hidden', type=bool, default=True)
-    parser.add_argument('--update_epochs', type=int, default=4)
+    parser.add_argument('--update_epochs', type=int, default=8)
     parser.add_argument('--clip_range', type=float, default=0.1)
     parser.add_argument('--max_grad_norm', type=float, default=0.0)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--batch_size', type=int, default=1024)
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--render', action='store_true', default=False)
-    parser.add_argument('--train', default=True)
+    parser.add_argument('--train', type=bool, default=True)
     parser.add_argument('--saved_path', type=str,
                         default='../saved/ppo_multiprocess')
     args = parser.parse_args()
