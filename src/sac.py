@@ -393,8 +393,7 @@ def main():
                         help='Value target update per no. of updates per step')
     parser.add_argument('--replay_size', type=int, default=1000000,
                         help='size of replay buffer')
-    parser.add_argument('--train', type=bool, default=True,
-                        help='Train a policy')
+    parser.add_argument('--test', action='store_true', default=False)
     parser.add_argument('--render', action='store_true', default=False)
     parser.add_argument('--saved_path', type=str, default='../saved/sac')
     args = parser.parse_args()
@@ -412,10 +411,10 @@ def main():
 
     # Agent
     agent = SAC(env.observation_space.shape[0], env.action_space, args)
-    if args.train:
-        agent.train(env)
-    else:
+    if args.test:
         agent.test(env)
+    else:
+        agent.train(env)
 
     env.close()
 

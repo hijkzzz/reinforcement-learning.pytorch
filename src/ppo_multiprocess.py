@@ -93,7 +93,7 @@ class PPO():
 
         # neural networks
         self.actor_critic = ActorCritic(action_size=args.action_size, hidden_size=args.hidden_size,
-                                        extra_hidden=args.extra_hidden, enlargement=args.enlargement, 
+                                        extra_hidden=args.extra_hidden, enlargement=args.enlargement,
                                         recurrent=args.recurrent, device=args.device).cuda()
         # args
         self.device = args.device
@@ -118,14 +118,14 @@ class PPO():
         # batch
         self.sample_envs = self.batch_size // self.num_steps
 
-    def select_action(self, states, hidden=None, stochastic=True):
+    def select_action(self, states, hidden=None, eval=False):
         # 1 * B * features
         states = torch.from_numpy(states).unsqueeze(0).to(
             device=self.device, dtype=torch.float32)
 
         with torch.no_grad():
             dist, _, hidden = self.actor_critic(states, hidden)
-        action = dist.sample() if stochastic else torch.argmax(dist.probs)
+        action = dist.sample() if not eval else torch.argmax(dist.probs, dim=2)
         log_prob = dist.log_prob(action)
         return action[0].cpu().tolist(), log_prob[0].cpu().numpy(), hidden
 
@@ -135,7 +135,8 @@ class PPO():
                    path + '/actor_critic.pkl')
 
     def load_param(self, path):
-        self.actor_critic.load(path + '/actor_critic.pkl')
+        self.actor_critic.load_state_dict(
+            torch.load(path + '/actor_critic.pkl'))
 
     def update_parameters(self, states, actions, action_log_probs, rewards, next_states, dones):
         # T * B * features
@@ -218,7 +219,7 @@ class PPO():
 
             self.optimizer.step()
 
-            if self.training_step % 1000 == 0:
+            if self.training_step % 10000 == 0:
                 self.save_param(self.saved_path)
 
         logger.info('UPDATE')
@@ -232,9 +233,9 @@ class PPO():
 
     def train(self, envs):
         self.training_step = 0
-        self.best_reward = 0
-        self.visited_rooms = set()
-        self.eplen = 0
+        best_reward = 0
+        visited_rooms = set()
+        eplen = 0
 
         rollout_idx = 0
         state = np.transpose(envs.reset(), (0, 3, 1, 2))
@@ -278,22 +279,21 @@ class PPO():
                     if dne:
                         epinfo = info[i]['episode']
                         if 'visited_rooms' in epinfo:
-                            self.visited_rooms.union(
-                                list(epinfo['visited_rooms']))
+                            visited_rooms |= epinfo['visited_rooms']
 
-                        self.best_reward = max(epinfo['r'], self.best_reward)
+                        best_reward = max(epinfo['r'], best_reward)
                         current_best_reward = max(
                             epinfo['r'], current_best_reward)
-                        self.eplen += epinfo['l']
+                        eplen += epinfo['l']
 
             # logger
             logger.info('GAME STATUS')
             logger.record_tabular('rollout_idx', rollout_idx)
             logger.record_tabular('visited_rooms',
-                                  str(len(self.visited_rooms)) + ', ' + str(self.visited_rooms))
-            logger.record_tabular('best_reward', self.best_reward)
+                                  str(len(visited_rooms)) + ', ' + str(visited_rooms))
+            logger.record_tabular('best_reward', best_reward)
             logger.record_tabular('current_best_reward', current_best_reward)
-            logger.record_tabular('eplen', self.eplen)
+            logger.record_tabular('eplen', eplen)
             logger.dump_tabular()
 
             # train neural networks
@@ -302,50 +302,54 @@ class PPO():
             rollout_idx += 1
 
     def test(self, envs):
-        self.training_step = 0
-        self.best_reward = 0
-        self.visited_rooms = set()
-        self.eplen = 0
+        self.load_param(self.saved_path)
 
         rollout_idx = 0
-        state = np.transpose(envs.reset(), (0, 2, 3, 1)) / 255.0
+        best_reward = 0
+        state = np.transpose(envs.reset(), (0, 3, 1, 2))
 
         # rollout
         while rollout_idx < self.num_rollouts:
-            current_best_reward = 0
+            rollout_idx += 1
+
+            current_visited_rooms = set()
+            current_eplen = 0
+            current_reward = 0
             hidden = None
 
-            for t in range(self.num_steps):
-                action, _, hidden = self.select_action(state, hidden, stochastic=False)
+            while True:
+                action, _, hidden = self.select_action(
+                    state, hidden, eval=True)
                 next_state, reward, done, info = envs.step(action)
                 # TensorFlow format to PyTorch
-                next_state = np.transpose(next_state, (0, 2, 3, 1)) / 255.0
+                next_state = np.transpose(next_state, (0, 3, 1, 2))
 
-                envs.render(0)
+                if self.render:
+                    envs.render(0)
                 state = next_state
 
                 # done
                 for i, dne in enumerate(done):
                     if dne:
-                        hidden[0][i] *= 0
-
                         epinfo = info[i]['episode']
                         if 'visited_rooms' in epinfo:
-                            self.visited_rooms.union(
-                                list(epinfo['visited_rooms']))
+                            current_visited_rooms = epinfo['visited_rooms']
 
-                        self.best_reward = max(epinfo['r'], self.best_reward)
-                        current_best_reward = max(
-                            epinfo['r'], current_best_reward)
-                        self.eplen += epinfo['l']
+                        best_reward = max(epinfo['r'], best_reward)
+                        current_reward = epinfo['r']
+                        current_eplen = epinfo['l']
+
+                if any(done):
+                    break
 
             # logger
             logger.info('GAME STATUS')
-            logger.record_tabular('visited_rooms',
-                                  str(len(self.visited_rooms)) + ', ' + str(self.visited_rooms))
-            logger.record_tabular('best_reward', self.best_reward)
-            logger.record_tabular('current_best_reward', current_best_reward)
-            logger.record_tabular('eplen', self.eplen)
+            logger.record_tabular('rollout_idx', rollout_idx)
+            logger.record_tabular('best_reward', best_reward)
+            logger.record_tabular('current_visited_rooms',
+                                  str(len(current_visited_rooms)) + ', ' + str(current_visited_rooms))
+            logger.record_tabular('current_reward', current_reward)
+            logger.record_tabular('current_eplen', current_eplen)
             logger.dump_tabular()
 
 
@@ -372,7 +376,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=2048)
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--render', action='store_true', default=False)
-    parser.add_argument('--train', type=bool, default=True)
+    parser.add_argument('--test', action='store_true', default=False)
     parser.add_argument('--saved_path', type=str,
                         default='../saved/ppo_multiprocess')
     args = parser.parse_args()
@@ -399,16 +403,19 @@ def main():
             return wrap_deepmind(env)
         return _thunk
 
+    if args.test:
+        args.num_envs = 1
+
     envs = [make_env(i) for i in range(args.num_envs)]
     envs = SubprocVecEnv(envs)
     args.action_size = envs.action_space.n
 
     agent = PPO(args)
 
-    if args.train:
-        agent.train(envs)
-    else:
+    if args.test:
         agent.test(envs)
+    else:
+        agent.train(envs)
 
     # Exit
     envs.close()
