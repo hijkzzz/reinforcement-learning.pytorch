@@ -118,14 +118,14 @@ class PPO():
         # batch
         self.sample_envs = self.batch_size // self.num_steps
 
-    def select_action(self, states, hidden=None):
+    def select_action(self, states, hidden=None, stochastic=True):
         # 1 * B * features
         states = torch.from_numpy(states).unsqueeze(0).to(
             device=self.device, dtype=torch.float32)
 
         with torch.no_grad():
             dist, _, hidden = self.actor_critic(states, hidden)
-        action = dist.sample()
+        action = dist.sample() if stochastic else torch.argmax(dist.probs)
         log_prob = dist.log_prob(action)
         return action[0].cpu().tolist(), log_prob[0].cpu().numpy(), hidden
 
@@ -316,7 +316,7 @@ class PPO():
             hidden = None
 
             for t in range(self.num_steps):
-                action, _, hidden = self.select_action(state)
+                action, _, hidden = self.select_action(state, hidden, stochastic=False)
                 next_state, reward, done, info = envs.step(action)
                 # TensorFlow format to PyTorch
                 next_state = np.transpose(next_state, (0, 2, 3, 1)) / 255.0
@@ -354,7 +354,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--env_name', type=str,
                         default='MontezumaRevengeNoFrameskip-v4')
-    parser.add_argument('--num_envs', type=int, default=32)
+    parser.add_argument('--num_envs', type=int, default=128)
     parser.add_argument('--num_steps', type=int, default=128)
     parser.add_argument('--max_episode_steps', type=int, default=4500)
     parser.add_argument('--num_rollouts', type=int, default=30000)
@@ -365,11 +365,11 @@ def main():
     parser.add_argument('--hidden_size', type=int, default=128)
     parser.add_argument('--enlargement', type=str, default='normal')
     parser.add_argument('--extra_hidden', type=bool, default=True)
-    parser.add_argument('--update_epochs', type=int, default=8)
+    parser.add_argument('--update_epochs', type=int, default=16)
     parser.add_argument('--clip_range', type=float, default=0.1)
     parser.add_argument('--max_grad_norm', type=float, default=0.0)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
-    parser.add_argument('--batch_size', type=int, default=1024)
+    parser.add_argument('--batch_size', type=int, default=2048)
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--render', action='store_true', default=False)
     parser.add_argument('--train', type=bool, default=True)
