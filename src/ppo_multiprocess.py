@@ -304,23 +304,24 @@ class PPO():
     def test(self, envs):
         self.load_param(self.saved_path)
 
-        rollout_idx = 0
         best_reward = 0
+        visited_rooms = set()
+        n_episodes = 0
+        mean_eplen = 0
+        mean_reward = 0
+
         state = np.transpose(envs.reset(), (0, 3, 1, 2))
 
         # rollout
+        rollout_idx = 0
         while rollout_idx < self.num_rollouts:
             rollout_idx += 1
-
-            current_visited_rooms = set()
-            current_eplen = 0
-            current_reward = 0
             hidden = None
 
-            while True:
+            for t in range(self.num_steps):
                 action, _, hidden = self.select_action(
                     state, hidden, eval=True)
-                next_state, reward, done, info = envs.step(action)
+                next_state, _, done, info = envs.step(action)
                 # TensorFlow format to PyTorch
                 next_state = np.transpose(next_state, (0, 3, 1, 2))
 
@@ -333,23 +334,21 @@ class PPO():
                     if dne:
                         epinfo = info[i]['episode']
                         if 'visited_rooms' in epinfo:
-                            current_visited_rooms = epinfo['visited_rooms']
+                            visited_rooms |= epinfo['visited_rooms']
 
                         best_reward = max(epinfo['r'], best_reward)
-                        current_reward = epinfo['r']
-                        current_eplen = epinfo['l']
-
-                if any(done):
-                    break
+                        mean_reward = (mean_reward * n_episodes + epinfo['r']) / (n_episodes + 1)
+                        mean_eplen = (mean_eplen * n_episodes + epinfo['l']) / (n_episodes + 1)
+                        n_episodes += 1
 
             # logger
             logger.info('GAME STATUS')
-            logger.record_tabular('rollout_idx', rollout_idx)
+            logger.record_tabular('n_episodes', n_episodes)
             logger.record_tabular('best_reward', best_reward)
-            logger.record_tabular('current_visited_rooms',
-                                  str(len(current_visited_rooms)) + ', ' + str(current_visited_rooms))
-            logger.record_tabular('current_reward', current_reward)
-            logger.record_tabular('current_eplen', current_eplen)
+            logger.record_tabular('visited_rooms',
+                                  str(len(visited_rooms)) + ', ' + str(visited_rooms))
+            logger.record_tabular('mean_reward', mean_reward)
+            logger.record_tabular('mean_eplen', mean_eplen)
             logger.dump_tabular()
 
 
@@ -402,9 +401,6 @@ def main():
                 logger.get_dir(), str(rank)), allow_early_resets=True)
             return wrap_deepmind(env)
         return _thunk
-
-    if args.test:
-        args.num_envs = 1
 
     envs = [make_env(i) for i in range(args.num_envs)]
     envs = SubprocVecEnv(envs)
