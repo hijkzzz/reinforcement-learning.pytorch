@@ -359,10 +359,10 @@ class PPO():
             logger.record_tabular('mean_eplen', mean_eplen)
             logger.dump_tabular()
 
-def run(args):
+def run(i, args):
     # distributed init
-    distributed_util.init(backend=args.dist_backend)
-    args.rank = dist.get_rank()
+    distributed_util.init(backend=args.dist_backend, rank=i, world_size=args.num_gpus)
+    args.rank = i
     args.device = torch.device('cuda:{}'.format(args.rank))
 
     # Set seed
@@ -434,7 +434,7 @@ def main():
     
     processes = []
     for i in range(args.num_gpus):
-        p = mp.Process(target=run, args=(args,))
+        p = mp.Process(target=run, args=(i, args))
         p.start()
         processes.append(p)
     for p in processes:
