@@ -14,7 +14,6 @@ from env import SubprocVecEnv
 from env import make_atari, wrap_deepmind
 from env import Monitor
 from util import logger
-from util import init_orthogonal_
 
 
 class ActorCritic(nn.Module):

@@ -7,15 +7,15 @@ import numpy as np
 import gym
 import torch
 from torch import nn
-from torch import optim
 from torch.distributions import Categorical
+from optim import DistributedAdam as Adam
+import torch.distributed as dist
 
 from env import SubprocVecEnv
 from env import make_atari, wrap_deepmind
 from env import Monitor
+from util import distributed_util
 from util import logger
-from util import init_orthogonal_
-
 
 class ActorCritic(nn.Module):
     def __init__(self, action_size, hidden_size=128, extra_hidden=True, enlargement='normal', recurrent=True, device=torch.device('cuda')):
@@ -96,6 +96,7 @@ class PPO():
                                         extra_hidden=args.extra_hidden, enlargement=args.enlargement,
                                         recurrent=args.recurrent, device=args.device).cuda()
         # args
+        self.rank = args.rank
         self.device = args.device
         self.num_steps = args.num_steps
         self.num_envs = args.num_envs
@@ -112,8 +113,7 @@ class PPO():
         self.coeff_ent = args.coeff_ent
 
         # optimizer
-        self.optimizer = optim.Adam(
-            self.actor_critic.parameters(), args.learning_rate)
+        self.optimizer = Adam(self.actor_critic.parameters(), args.learning_rate)
 
         # batch
         self.sample_envs = self.batch_size // self.num_steps
@@ -170,14 +170,15 @@ class PPO():
 
             returns = advantages + values[:-1]
 
-        logger.info('GENERALIZED ADVANTAGE ESTIMATION')
-        logger.record_tabular('advantages mean', advantages.mean(dim=(0, 1)))
-        logger.record_tabular('advantages std', advantages.std(dim=(0, 1)))
-        logger.record_tabular('returns mean',
-                              returns.mean(dim=(0, 1)))
-        logger.record_tabular('returns std',
-                              returns.std(dim=(0, 1)))
-        logger.dump_tabular()
+        if self.rank == 0:
+            logger.info('GENERALIZED ADVANTAGE ESTIMATION')
+            logger.record_tabular('advantages mean', advantages.mean(dim=(0, 1)))
+            logger.record_tabular('advantages std', advantages.std(dim=(0, 1)))
+            logger.record_tabular('returns mean',
+                                returns.mean(dim=(0, 1)))
+            logger.record_tabular('returns std',
+                                returns.std(dim=(0, 1)))
+            logger.dump_tabular()
 
         # train epochs
         for epoch_idx in range(self.update_epochs):
@@ -219,19 +220,23 @@ class PPO():
 
             self.optimizer.step()
 
-            if self.training_step % 10000 == 0:
+            if self.rank == 0 and self.training_step % 10000 == 0:
                 self.save_param(self.saved_path)
 
-        logger.info('UPDATE')
-        logger.record_tabular('training_step',
-                              self.training_step)
-        logger.record_tabular('value_loss',
-                              value_loss.item())
-        logger.record_tabular('policy_loss', action_loss.item())
-        logger.record_tabular('entropy_loss', entropy_loss.item())
-        logger.dump_tabular()
+        if self.rank == 0:
+            logger.info('UPDATE')
+            logger.record_tabular('training_step',
+                                self.training_step)
+            logger.record_tabular('value_loss',
+                                value_loss.item())
+            logger.record_tabular('policy_loss', action_loss.item())
+            logger.record_tabular('entropy_loss', entropy_loss.item())
+            logger.dump_tabular()
 
     def train(self, envs):
+        # sync model
+        distributed_util.sync_model(self.actor_critic)
+
         self.training_step = 0
         best_reward = 0
         visited_rooms = set()
@@ -287,14 +292,15 @@ class PPO():
                         eplen += epinfo['l']
 
             # logger
-            logger.info('GAME STATUS')
-            logger.record_tabular('rollout_idx', rollout_idx)
-            logger.record_tabular('visited_rooms',
-                                  str(len(visited_rooms)) + ', ' + str(visited_rooms))
-            logger.record_tabular('best_reward', best_reward)
-            logger.record_tabular('current_best_reward', current_best_reward)
-            logger.record_tabular('eplen', eplen)
-            logger.dump_tabular()
+            if self.rank == 0:
+                logger.info('GAME STATUS')
+                logger.record_tabular('rollout_idx', rollout_idx)
+                logger.record_tabular('visited_rooms',
+                                    str(len(visited_rooms)) + ', ' + str(visited_rooms))
+                logger.record_tabular('best_reward', best_reward)
+                logger.record_tabular('current_best_reward', current_best_reward)
+                logger.record_tabular('eplen', eplen)
+                logger.dump_tabular()
 
             # train neural networks
             self.update_parameters(states, actions, action_log_probs,
@@ -357,7 +363,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--env_name', type=str,
                         default='MontezumaRevengeNoFrameskip-v4')
-    parser.add_argument('--num_envs', type=int, default=128)
+    parser.add_argument('--num_envs', type=int, default=32)
     parser.add_argument('--num_steps', type=int, default=128)
     parser.add_argument('--max_episode_steps', type=int, default=4500)
     parser.add_argument('--num_rollouts', type=int, default=30000)
@@ -368,11 +374,11 @@ def main():
     parser.add_argument('--hidden_size', type=int, default=128)
     parser.add_argument('--enlargement', type=str, default='normal')
     parser.add_argument('--extra_hidden', type=bool, default=True)
-    parser.add_argument('--update_epochs', type=int, default=16)
+    parser.add_argument('--update_epochs', type=int, default=8)
     parser.add_argument('--clip_range', type=float, default=0.1)
     parser.add_argument('--max_grad_norm', type=float, default=0.0)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
-    parser.add_argument('--batch_size', type=int, default=2048)
+    parser.add_argument('--batch_size', type=int, default=1024)
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--render', action='store_true', default=False)
     parser.add_argument('--test', action='store_true', default=False)
@@ -380,17 +386,18 @@ def main():
                         default='../saved/ppo_multiprocess')
     args = parser.parse_args()
 
-    # Enable CUDA
-    use_cuda = torch.cuda.is_available()
-    args.device = torch.device('cuda' if use_cuda else 'cpu')
-    torch.cuda.current_device()  # fix init bug in Windows 10
+    # distributed init
+    distributed_util.init(backend="gloo")
+    args.rank = dist.get_rank()
+    args.device = torch.device('cuda:{}'.format(args.rank))
 
     # Set seed
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
-    # torch.backends.cudnn.deterministic = True
-    np.random.seed(args.seed)
-    random.seed(args.seed)
+    seed = args.seed + args.rank
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
 
     # Create envs
     def make_env(rank):
@@ -402,7 +409,7 @@ def main():
             return wrap_deepmind(env)
         return _thunk
 
-    envs = [make_env(i) for i in range(args.num_envs)]
+    envs = [make_env(args.rank + i) for i in range(args.num_envs)]
     envs = SubprocVecEnv(envs)
     args.action_size = envs.action_space.n
 
