@@ -8,9 +8,10 @@ import gym
 import torch
 from torch import nn
 from torch.distributions import Categorical
-from optim import DistributedAdam as Adam
 import torch.distributed as dist
+import torch.multiprocessing as mp
 
+from optim import DistributedAdam as Adam
 from env import SubprocVecEnv
 from env import make_atari, wrap_deepmind
 from env import Monitor
@@ -220,6 +221,7 @@ class PPO():
 
             self.optimizer.step()
 
+            # save models
             if self.rank == 0 and self.training_step % 10000 == 0:
                 self.save_param(self.saved_path)
 
@@ -357,37 +359,9 @@ class PPO():
             logger.record_tabular('mean_eplen', mean_eplen)
             logger.dump_tabular()
 
-
-def main():
-    # Parameters
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--env_name', type=str,
-                        default='MontezumaRevengeNoFrameskip-v4')
-    parser.add_argument('--num_envs', type=int, default=32)
-    parser.add_argument('--num_steps', type=int, default=128)
-    parser.add_argument('--max_episode_steps', type=int, default=4500)
-    parser.add_argument('--num_rollouts', type=int, default=30000)
-    parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--coeff_ent', type=float, default=0.001)
-    parser.add_argument('--recurrent', type=bool, default=True)
-    parser.add_argument('--lamda', type=float, default=0.95)
-    parser.add_argument('--hidden_size', type=int, default=128)
-    parser.add_argument('--enlargement', type=str, default='normal')
-    parser.add_argument('--extra_hidden', type=bool, default=True)
-    parser.add_argument('--update_epochs', type=int, default=8)
-    parser.add_argument('--clip_range', type=float, default=0.1)
-    parser.add_argument('--max_grad_norm', type=float, default=0.0)
-    parser.add_argument('--learning_rate', type=float, default=1e-4)
-    parser.add_argument('--batch_size', type=int, default=1024)
-    parser.add_argument('--seed', type=int, default=1234)
-    parser.add_argument('--render', action='store_true', default=False)
-    parser.add_argument('--test', action='store_true', default=False)
-    parser.add_argument('--saved_path', type=str,
-                        default='../saved/ppo_multiprocess')
-    args = parser.parse_args()
-
+def run(args):
     # distributed init
-    distributed_util.init(backend="gloo")
+    distributed_util.init(backend=args.dist_backend)
     args.rank = dist.get_rank()
     args.device = torch.device('cuda:{}'.format(args.rank))
 
@@ -423,6 +397,48 @@ def main():
     # Exit
     envs.close()
 
+
+def main():
+    # Parameters
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--env_name', type=str,
+                        default='MontezumaRevengeNoFrameskip-v4')
+    parser.add_argument('--num_envs', type=int, default=32)
+    parser.add_argument('--num_steps', type=int, default=128)
+    parser.add_argument('--max_episode_steps', type=int, default=4500)
+    parser.add_argument('--num_rollouts', type=int, default=30000)
+    parser.add_argument('--gamma', type=float, default=0.99)
+    parser.add_argument('--coeff_ent', type=float, default=0.001)
+    parser.add_argument('--recurrent', type=bool, default=True)
+    parser.add_argument('--lamda', type=float, default=0.95)
+    parser.add_argument('--hidden_size', type=int, default=128)
+    parser.add_argument('--enlargement', type=str, default='normal')
+    parser.add_argument('--extra_hidden', type=bool, default=True)
+    parser.add_argument('--update_epochs', type=int, default=8)
+    parser.add_argument('--clip_range', type=float, default=0.1)
+    parser.add_argument('--max_grad_norm', type=float, default=0.0)
+    parser.add_argument('--learning_rate', type=float, default=1e-4)
+    parser.add_argument('--batch_size', type=int, default=1024)
+    parser.add_argument('--seed', type=int, default=1234)
+    parser.add_argument('--render', action='store_true', default=False)
+    parser.add_argument('--num_gpus', type=int, default=4)
+    parser.add_argument('--dist_backend', type=str, default='nccl')
+    parser.add_argument('--test', action='store_true', default=False)
+    parser.add_argument('--saved_path', type=str,
+                        default='../saved/ppo_multiprocess')
+    args = parser.parse_args()
+
+    # use 1 gpu for testing
+    if args.test == True:
+        args.num_gpus = 1
+    
+    processes = []
+    for i in range(args.num_gpus):
+        p = mp.Process(target=run, args=(args,))
+        p.start()
+        processes.append(p)
+    for p in processes:
+        p.join()
 
 if __name__ == '__main__':
     main()
