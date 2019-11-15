@@ -7,4 +7,5 @@ def init(backend, rank, world_size):
                             world_size=world_size)
 
 def sync_model(model):
-    dist.broadcast_multigpu(list(model.parameters()), src=0)
+    for param in model.parameters():
+        dist.broadcast(param.grad.data, src=0)

@@ -15,14 +15,12 @@ class DistributedAdam(optim.Adam):
 
     def step(self): # use super(SharedAdam, self).step
         size = float(dist.get_world_size())
-        tensorlist = []
 
         for group in self.param_groups:
             for p in group['params']:
                 if p.grad is None:
                     continue
                 p.grad.data /= size
-                tensorlist.append(p.grad.data)
+                dist.all_reduce(p.grad.data, op=dist.ReduceOp.SUM)
 
-        dist.all_reduce_multigpu(tensorlist, op=dist.ReduceOp.SUM)
         return super(DistributedAdam, self).step()
