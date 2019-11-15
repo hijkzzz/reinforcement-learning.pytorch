@@ -95,7 +95,7 @@ class PPO():
         # neural networks
         self.actor_critic = ActorCritic(action_size=args.action_size, hidden_size=args.hidden_size,
                                         extra_hidden=args.extra_hidden, enlargement=args.enlargement,
-                                        recurrent=args.recurrent, device=args.device).cuda()
+                                        recurrent=args.recurrent, device=args.device).to(args.device)
         # args
         self.rank = args.rank
         self.device = args.device
