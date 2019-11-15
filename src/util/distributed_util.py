@@ -8,4 +8,4 @@ def init(backend, rank, world_size):
 
 def sync_model(model):
     for param in model.parameters():
-        dist.broadcast(param.grad.data, src=0)
+        dist.broadcast(param.data, src=0)
