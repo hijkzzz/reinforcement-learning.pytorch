@@ -300,6 +300,7 @@ class PPO():
             # logger
             dist.all_reduce(best_reward, op=dist.ReduceOp.MAX)
             dist.all_reduce(current_best_reward, op=dist.ReduceOp.MAX)
+            # TODO: sync visited_rooms
 
             if self.rank == 0:
                 logger.info('GAME STATUS')
@@ -396,7 +397,7 @@ def run(i, args):
             return wrap_deepmind(env)
         return _thunk
 
-    envs = [make_env(args.rank + i) for i in range(args.num_envs)]
+    envs = [make_env(args.rank * args.num_envs + i) for i in range(args.num_envs)]
     envs = SubprocVecEnv(envs)
     args.action_size = envs.action_space.n
 
