@@ -18,6 +18,7 @@ from env import Monitor
 from util import distributed_util
 from util import logger
 
+
 class ActorCritic(nn.Module):
     def __init__(self, action_size, hidden_size=128, extra_hidden=True, enlargement='normal', recurrent=True, device=torch.device('cuda')):
         super(ActorCritic, self).__init__()
@@ -114,7 +115,8 @@ class PPO():
         self.coeff_ent = args.coeff_ent
 
         # optimizer
-        self.optimizer = Adam(self.actor_critic.parameters(), args.learning_rate)
+        self.optimizer = Adam(
+            self.actor_critic.parameters(), args.learning_rate)
 
         # batch
         self.sample_envs = self.batch_size // self.num_steps
@@ -173,12 +175,13 @@ class PPO():
 
         if self.rank == 0:
             logger.info('GENERALIZED ADVANTAGE ESTIMATION')
-            logger.record_tabular('advantages mean', advantages.mean(dim=(0, 1)))
+            logger.record_tabular(
+                'advantages mean', advantages.mean(dim=(0, 1)))
             logger.record_tabular('advantages std', advantages.std(dim=(0, 1)))
             logger.record_tabular('returns mean',
-                                returns.mean(dim=(0, 1)))
+                                  returns.mean(dim=(0, 1)))
             logger.record_tabular('returns std',
-                                returns.std(dim=(0, 1)))
+                                  returns.std(dim=(0, 1)))
             logger.dump_tabular()
 
         # train epochs
@@ -228,27 +231,28 @@ class PPO():
         if self.rank == 0:
             logger.info('UPDATE')
             logger.record_tabular('training_step',
-                                self.training_step)
+                                  self.training_step)
             logger.record_tabular('value_loss',
-                                value_loss.item())
+                                  value_loss.item())
             logger.record_tabular('policy_loss', action_loss.item())
             logger.record_tabular('entropy_loss', entropy_loss.item())
             logger.dump_tabular()
 
     def train(self, envs):
-        # sync model
-        distributed_util.sync_model(self.actor_critic)
 
         self.training_step = 0
-        best_reward = 0
+        best_reward = torch.zeros((1,), device=self.device)
+        eplen = torch.zeros((1,), device=self.device, dtype=torch.int32)
         visited_rooms = set()
-        eplen = 0
 
         rollout_idx = 0
         state = np.transpose(envs.reset(), (0, 3, 1, 2))
 
         # rollout
         while rollout_idx < self.num_rollouts:
+            # sync model
+            distributed_util.sync_model(self.actor_critic)
+
             states = np.zeros(
                 (self.num_steps, self.num_envs, 1, 84, 84), np.float32)
             actions = np.zeros((self.num_steps, self.num_envs), np.int32)
@@ -259,7 +263,7 @@ class PPO():
                 (self.num_steps, self.num_envs, 1, 84, 84), np.float32)
             dones = np.zeros((self.num_steps, self.num_envs), np.int32)
 
-            current_best_reward = 0
+            current_best_reward = torch.zeros((1,), device=self.device)
             hidden = None
 
             for t in range(self.num_steps):
@@ -288,20 +292,25 @@ class PPO():
                         if 'visited_rooms' in epinfo:
                             visited_rooms |= epinfo['visited_rooms']
 
-                        best_reward = max(epinfo['r'], best_reward)
-                        current_best_reward = max(
-                            epinfo['r'], current_best_reward)
-                        eplen += epinfo['l']
+                        best_reward[0] = max(epinfo['r'], best_reward[0])
+                        current_best_reward[0] = max(
+                            epinfo['r'], current_best_reward[0])
+                        eplen[0] += epinfo['l']
 
             # logger
+            dist.all_reduce(best_reward, op=dist.ReduceOp.MAX)
+            dist.all_reduce(current_best_reward, op=dist.ReduceOp.MAX)
+
             if self.rank == 0:
                 logger.info('GAME STATUS')
                 logger.record_tabular('rollout_idx', rollout_idx)
                 logger.record_tabular('visited_rooms',
-                                    str(len(visited_rooms)) + ', ' + str(visited_rooms))
-                logger.record_tabular('best_reward', best_reward)
-                logger.record_tabular('current_best_reward', current_best_reward)
-                logger.record_tabular('eplen', eplen)
+                                      str(len(visited_rooms)) + ', ' + str(visited_rooms))
+                logger.record_tabular('best_reward', best_reward.item())
+                logger.record_tabular(
+                    'current_best_reward', current_best_reward.item())
+                logger.record_tabular(
+                    'eplen', eplen.item() * dist.get_world_size())
                 logger.dump_tabular()
 
             # train neural networks
@@ -345,8 +354,10 @@ class PPO():
                             visited_rooms |= epinfo['visited_rooms']
 
                         best_reward = max(epinfo['r'], best_reward)
-                        mean_reward = (mean_reward * n_episodes + epinfo['r']) / (n_episodes + 1)
-                        mean_eplen = (mean_eplen * n_episodes + epinfo['l']) / (n_episodes + 1)
+                        mean_reward = (mean_reward * n_episodes +
+                                       epinfo['r']) / (n_episodes + 1)
+                        mean_eplen = (mean_eplen * n_episodes +
+                                      epinfo['l']) / (n_episodes + 1)
                         n_episodes += 1
 
             # logger
@@ -359,19 +370,21 @@ class PPO():
             logger.record_tabular('mean_eplen', mean_eplen)
             logger.dump_tabular()
 
+
 def run(i, args):
     # distributed init
-    distributed_util.init(backend=args.dist_backend, rank=i, world_size=args.num_gpus)
+    distributed_util.init(backend=args.dist_backend,
+                          init_method="tcp://127.0.0.1:2345", rank=i, world_size=args.num_gpus)
     args.rank = i
     args.device = torch.device('cuda:{}'.format(args.rank))
 
     # Set seed
-    seed = args.seed + args.rank
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.backends.cudnn.deterministic = True
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    # torch.backends.cudnn.deterministic = True
+
+    np.random.seed(args.seed + args.rank)
+    random.seed(args.seed + args.rank)
 
     # Create envs
     def make_env(rank):
@@ -403,7 +416,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--env_name', type=str,
                         default='MontezumaRevengeNoFrameskip-v4')
-    parser.add_argument('--num_envs', type=int, default=64)
+    parser.add_argument('--num_envs', type=int, default=32)
     parser.add_argument('--num_steps', type=int, default=128)
     parser.add_argument('--max_episode_steps', type=int, default=4500)
     parser.add_argument('--num_rollouts', type=int, default=30000)
@@ -418,10 +431,10 @@ def main():
     parser.add_argument('--clip_range', type=float, default=0.1)
     parser.add_argument('--max_grad_norm', type=float, default=0.0)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
-    parser.add_argument('--batch_size', type=int, default=2048)
+    parser.add_argument('--batch_size', type=int, default=1024)
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--render', action='store_true', default=False)
-    parser.add_argument('--num_gpus', type=int, default=2)
+    parser.add_argument('--num_gpus', type=int, default=4)
     parser.add_argument('--dist_backend', type=str, default='nccl')
     parser.add_argument('--test', action='store_true', default=False)
     parser.add_argument('--saved_path', type=str,
@@ -430,7 +443,7 @@ def main():
 
     if args.test == True:
         args.num_gpus = 1
-    
+
     processes = []
     for i in range(args.num_gpus):
         p = mp.Process(target=run, args=(i, args))
@@ -438,6 +451,7 @@ def main():
         processes.append(p)
     for p in processes:
         p.join()
+
 
 if __name__ == '__main__':
     main()
