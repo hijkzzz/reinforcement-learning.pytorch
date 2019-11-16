@@ -403,7 +403,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--env_name', type=str,
                         default='MontezumaRevengeNoFrameskip-v4')
-    parser.add_argument('--num_envs', type=int, default=32)
+    parser.add_argument('--num_envs', type=int, default=64)
     parser.add_argument('--num_steps', type=int, default=128)
     parser.add_argument('--max_episode_steps', type=int, default=4500)
     parser.add_argument('--num_rollouts', type=int, default=30000)
@@ -418,17 +418,16 @@ def main():
     parser.add_argument('--clip_range', type=float, default=0.1)
     parser.add_argument('--max_grad_norm', type=float, default=0.0)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
-    parser.add_argument('--batch_size', type=int, default=1024)
+    parser.add_argument('--batch_size', type=int, default=2048)
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--render', action='store_true', default=False)
-    parser.add_argument('--num_gpus', type=int, default=4)
+    parser.add_argument('--num_gpus', type=int, default=2)
     parser.add_argument('--dist_backend', type=str, default='nccl')
     parser.add_argument('--test', action='store_true', default=False)
     parser.add_argument('--saved_path', type=str,
                         default='../saved/ppo_multiprocess')
     args = parser.parse_args()
 
-    # use 1 gpu for testing
     if args.test == True:
         args.num_gpus = 1
     
