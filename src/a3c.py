@@ -1,188 +1,129 @@
-"""
-Reinforcement Learning (A3C) using Pytorch + multiprocessing.
-The most simple implementation for continuous action.
-View more on my Chinese tutorial page [莫烦Python](https://morvanzhou.github.io/).
-"""
-
-import torch
-from torch import nn
-import torch.nn.functional as F
-import torch.multiprocessing as mp
-
 import gym
-import numpy as np
-import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.distributions import Categorical
+import torch.multiprocessing as mp
+import time
 
-from optim import SharedAdam
-
-
-def v_wrap(np_array, dtype=np.float32):
-    if np_array.dtype != dtype:
-        np_array = np_array.astype(dtype)
-    return torch.from_numpy(np_array)
-
-
-def set_init(layers):
-    for layer in layers:
-        nn.init.normal_(layer.weight, mean=0., std=0.1)
-        nn.init.constant_(layer.bias, 0.)
-
-
-def push_and_pull(opt, lnet, gnet, done, s_, bs, ba, br, gamma):
-    if done:
-        v_s_ = 0.               # terminal
-    else:
-        v_s_ = lnet.forward(v_wrap(s_[None, :]))[-1].data.numpy()[0, 0]
-
-    buffer_v_target = []
-    for r in br[::-1]:    # reverse buffer r
-        v_s_ = r + gamma * v_s_
-        buffer_v_target.append(v_s_)
-    buffer_v_target.reverse()
-
-    loss = lnet.loss_func(
-        v_wrap(np.vstack(bs)),
-        v_wrap(np.array(ba), dtype=np.int64) if ba[0].dtype == np.int64 else v_wrap(
-            np.vstack(ba)),
-        v_wrap(np.array(buffer_v_target)[:, None]))
-
-    # calculate local gradients and push local parameters to global
-    opt.zero_grad()
-    loss.backward()
-    for lp, gp in zip(lnet.parameters(), gnet.parameters()):
-        gp._grad = lp.grad
-    opt.step()
-
-    # pull global parameters
-    lnet.load_state_dict(gnet.state_dict())
+# Hyperparameters
+n_train_processes = 3
+learning_rate = 0.0002
+update_interval = 5
+gamma = 0.98
+max_train_ep = 300
+max_test_ep = 400
 
 
-def record(global_ep, global_ep_r, ep_r, res_queue, name):
-    with global_ep.get_lock():
-        global_ep.value += 1
-    with global_ep_r.get_lock():
-        if global_ep_r.value == 0.:
-            global_ep_r.value = ep_r
-        else:
-            global_ep_r.value = global_ep_r.value * 0.99 + ep_r * 0.01
-    res_queue.put(global_ep_r.value)
-    print(
-        name,
-        "Ep:", global_ep.value,
-        "| Ep_r: %.0f" % global_ep_r.value,
-    )
+class ActorCritic(nn.Module):
+    def __init__(self):
+        super(ActorCritic, self).__init__()
+        self.fc1 = nn.Linear(4, 256)
+        self.fc_pi = nn.Linear(256, 2)
+        self.fc_v = nn.Linear(256, 1)
 
-class Net(nn.Module):
-    def __init__(self, s_dim, a_dim):
-        super(Net, self).__init__()
-        self.s_dim = s_dim
-        self.a_dim = a_dim
-        self.pi1 = nn.Linear(s_dim, 200)
-        self.pi2 = nn.Linear(200, a_dim)
-        self.v1 = nn.Linear(s_dim, 100)
-        self.v2 = nn.Linear(100, 1)
-        set_init([self.pi1, self.pi2, self.v1, self.v2])
-        self.distribution = torch.distributions.Categorical
+    def pi(self, x, softmax_dim=0):
+        x = F.relu(self.fc1(x))
+        x = self.fc_pi(x)
+        prob = F.softmax(x, dim=softmax_dim)
+        return prob
 
-    def forward(self, x):
-        pi1 = F.relu6(self.pi1(x))
-        logits = self.pi2(pi1)
-        v1 = F.relu6(self.v1(x))
-        values = self.v2(v1)
-        return logits, values
-
-    def choose_action(self, s):
-        self.eval()
-        logits, _ = self.forward(s)
-        prob = F.softmax(logits, dim=1).data
-        m = self.distribution(prob)
-        return m.sample().numpy()[0]
-
-    def loss_func(self, s, a, v_t):
-        self.train()
-        logits, values = self.forward(s)
-        td = v_t - values
-        c_loss = td.pow(2)
-
-        probs = F.softmax(logits, dim=1)
-        m = self.distribution(probs)
-        exp_v = m.log_prob(a) * td.detach().squeeze()
-        a_loss = -exp_v
-        total_loss = (c_loss + a_loss).mean()
-        return total_loss
+    def v(self, x):
+        x = F.relu(self.fc1(x))
+        v = self.fc_v(x)
+        return v
 
 
-class Worker(mp.Process):
-    def __init__(self, gnet, opt, global_ep, global_ep_r, res_queue, name):
-        super(Worker, self).__init__()
-        self.name = 'w%i' % name
-        self.g_ep, self.g_ep_r, self.res_queue = global_ep, global_ep_r, res_queue
-        self.gnet, self.opt = gnet, opt
-        self.lnet = Net(N_S, N_A)           # local network
-        self.env = gym.make('CartPole-v0').unwrapped
+def train(global_model, rank):
+    local_model = ActorCritic()
+    local_model.load_state_dict(global_model.state_dict())
 
-    def run(self):
-        total_step = 1
-        while self.g_ep.value < MAX_EP:
-            s = self.env.reset()
-            buffer_s, buffer_a, buffer_r = [], [], []
-            ep_r = 0.
-            while True:
-                if self.name == 'w0':
-                    self.env.render()
-                a = self.lnet.choose_action(v_wrap(s[None, :]))
-                s_, r, done, _ = self.env.step(a)
+    optimizer = optim.Adam(global_model.parameters(), lr=learning_rate)
+
+    env = gym.make('CartPole-v1')
+
+    for n_epi in range(max_train_ep):
+        done = False
+        s = env.reset()
+        while not done:
+            s_lst, a_lst, r_lst = [], [], []
+            for t in range(update_interval):
+                prob = local_model.pi(torch.from_numpy(s).float())
+                m = Categorical(prob)
+                a = m.sample().item()
+                s_prime, r, done, info = env.step(a)
+
+                s_lst.append(s)
+                a_lst.append([a])
+                r_lst.append(r/100.0)
+
+                s = s_prime
                 if done:
-                    r = -1
-                ep_r += r
-                buffer_a.append(a)
-                buffer_s.append(s)
-                buffer_r.append(r)
+                    break
 
-                if total_step % UPDATE_GLOBAL_ITER == 0 or done:  # update global and assign to local net
-                    # sync
-                    push_and_pull(self.opt, self.lnet, self.gnet,
-                                  done, s_, buffer_s, buffer_a, buffer_r, GAMMA)
-                    buffer_s, buffer_a, buffer_r = [], [], []
+            s_final = torch.tensor(s_prime, dtype=torch.float)
+            R = 0.0 if done else local_model.v(s_final).item()
+            td_target_lst = []
+            for reward in r_lst[::-1]:
+                R = gamma * R + reward
+                td_target_lst.append([R])
+            td_target_lst.reverse()
 
-                    if done:  # done and print information
-                        record(self.g_ep, self.g_ep_r, ep_r,
-                               self.res_queue, self.name)
-                        break
-                s = s_
-                total_step += 1
-        self.res_queue.put(None)
+            s_batch, a_batch, td_target = torch.tensor(s_lst, dtype=torch.float), torch.tensor(a_lst), \
+                torch.tensor(td_target_lst)
+            advantage = td_target - local_model.v(s_batch)
+
+            pi = local_model.pi(s_batch, softmax_dim=1)
+            pi_a = pi.gather(1, a_batch)
+            loss = -torch.log(pi_a) * advantage.detach() + \
+                F.smooth_l1_loss(local_model.v(s_batch), td_target.detach())
+
+            optimizer.zero_grad()
+            loss.mean().backward()
+            for global_param, local_param in zip(global_model.parameters(), local_model.parameters()):
+                global_param._grad = local_param.grad
+            optimizer.step()
+            local_model.load_state_dict(global_model.state_dict())
+
+    env.close()
+    print("Training process {} reached maximum episode.".format(rank))
 
 
-if __name__ == "__main__":
-    UPDATE_GLOBAL_ITER = 10
-    GAMMA = 0.9
-    MAX_EP = 4000
+def test(global_model):
+    env = gym.make('CartPole-v1')
+    score = 0.0
+    print_interval = 20
 
-    env = gym.make('CartPole-v0')
-    N_S = env.observation_space.shape[0]
-    N_A = env.action_space.n
+    for n_epi in range(max_test_ep):
+        done = False
+        s = env.reset()
+        while not done:
+            prob = global_model.pi(torch.from_numpy(s).float())
+            a = Categorical(prob).sample().item()
+            s_prime, r, done, info = env.step(a)
+            s = s_prime
+            score += r
 
-    gnet = Net(N_S, N_A)        # global network
-    gnet.share_memory()         # share the global parameters in multiprocessing
-    opt = SharedAdam(gnet.parameters(), lr=0.0001)      # global optimizer
-    global_ep, global_ep_r, res_queue = mp.Value(
-        'i', 0), mp.Value('d', 0.), mp.Queue()
+        if n_epi % print_interval == 0 and n_epi != 0:
+            print("# of episode :{}, avg score : {:.1f}".format(
+                n_epi, score/print_interval))
+            score = 0.0
+            time.sleep(1)
+    env.close()
 
-    # parallel training
-    workers = [Worker(gnet, opt, global_ep, global_ep_r, res_queue, i)
-               for i in range(mp.cpu_count())]
-    [w.start() for w in workers]
-    res = []                    # record episode reward to plot
-    while True:
-        r = res_queue.get()
-        if r is not None:
-            res.append(r)
+
+if __name__ == '__main__':
+    global_model = ActorCritic()
+    global_model.share_memory()
+
+    processes = []
+    for rank in range(n_train_processes + 1):  # + 1 for test process
+        if rank == 0:
+            p = mp.Process(target=test, args=(global_model,))
         else:
-            break
-    [w.join() for w in workers]
-
-    plt.plot(res)
-    plt.ylabel('Moving average ep reward')
-    plt.xlabel('Step')
-    plt.show()
+            p = mp.Process(target=train, args=(global_model, rank,))
+        p.start()
+        processes.append(p)
+    for p in processes:
+        p.join()
